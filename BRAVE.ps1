@@ -267,10 +267,24 @@ function Get-ActiveDirectory {
             
             'RUNTIME' = { # Runtime environment
                 try {
+                    $computerSystem = Get-CimInstance -ClassName Win32_ComputerSystem
+                    $domainStatus = if ($computerSystem.PartOfDomain) {
+                        "Domain Joined: $($computerSystem.Domain)"
+                    } else {
+                        "Workgroup: $($computerSystem.Workgroup)"
+                    }
+
                     @{
                         'Time ' = Format-DateTime $script:StartTime -Format Write
                         'Computer' = $env:COMPUTERNAME
                         'User' = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+                        'Operating System' = (Get-CimInstance -ClassName Win32_OperatingSystem).Caption
+                        'Domain Status' = $domainStatus
+                        'PSCommandPath' = $PSCommandPath
+                        'MyInvocation.Line' = $MyInvocation.Line
+                        'MyInvocation.MyCommand.Path' = $MyInvocation.MyCommand.Path
+                        'MyInvocation.MyCommand.Name' = $MyInvocation.MyCommand.Name
+                        'Host.Name' = $Host.Name
                     } | & $script:ExportData -Name $section -IsSummary
                 } catch {
                     & $script:HandleError $section "Failed gathering $section"
@@ -312,18 +326,22 @@ function Get-ActiveDirectory {
             'DOMAIN CONTROLLERS' = { # Domain topology
                 Write-Console -Message "$section" -Type info        
                 try {
+                    # Store DC data first
                     $DCs = Get-ADDomainController -Filter * | 
                         Select-Object HostName, Name, OperatingSystem, OperatingSystemVersion, 
-                                    ComputerObjectDN, IsGlobalCatalog, IPv4Address |
-                        & $script:ExportData -Name "$section"
-
-                    $DCs | ForEach-Object {
+                                    ComputerObjectDN, IsGlobalCatalog, IPv4Address
+                
+                    # Export detailed data
+                    $DCs | & $script:ExportData -Name "$section"
+                
+                    # Export summary data
+                    foreach ($dc in $DCs) {
                         [ordered]@{
-                            'DC' = $_.HostName
-                            'Operating System' = $_.OperatingSystemVersion
+                            'DC' = $dc.HostName
+                            'Operating System' = $dc.OperatingSystemVersion
                         } | & $script:ExportData -Name $section -IsSummary
                     }
-
+                
                 } catch {
                     & $script:HandleError $section "Failed gathering $section"
                 }
