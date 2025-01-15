@@ -5,11 +5,11 @@
     Active Directory queries for the purpose of a BRAVE assessments.
     Includes automated evidence collection for Veeam Backup & Replication, as an alternative to screenshots.
 .NOTES
-    Version:    2.0.0
-    Author:     Patrick O'Brien
-    Date:       January 8, 2024
-    Purpose:    Consolidation of 'Trimarc' and 'Composite' scripts with standardized output, naming, time format, error handling, message handling.
-Requirements:   PowerShell v5, Run as Administrator, GroupPolicy PowerShell module, Remote Server Administration Tools (RSAT)
+    Version:        2.0.0
+    Author:         Patrick O'Brien
+    Date:           January 8, 2024
+    Purpose:        Consolidation of 'Trimarc' and 'Composite' scripts with standardized output, naming, time format, error handling, message handling.
+    Requirements:   PowerShell v5 (Run as Administrator), GroupPolicy PowerShell module, Remote Server Administration Tools (RSAT)
 .EXAMPLE
     PS> C:\temp\BRAVE.ps1
 #>
@@ -46,7 +46,7 @@ function Format-DateTime {
     $utcTime = $DateTime.ToUniversalTime()
     
     switch($Format) {
-        'Write'   { $utcTime.ToString('MMM dd, yyyy HH:mm') }
+        'Write'   { $utcTime.ToString('MMM dd, yyyy HH:mm (UTC)') }
         'File'    { $utcTime.ToString('MMM-dd-yyyy_HHmmss') }
     }
 }
@@ -154,7 +154,7 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     throw
 }
 
-# Validate integrity of Archive file
+# Helper: Validate archive file
 function Test-Archive {
     [CmdletBinding()]
     param (
@@ -268,7 +268,7 @@ function Get-ActiveDirectory {
             'RUNTIME' = { # Runtime environment
                 try {
                     @{
-                        'Time (UTC)' = Format-DateTime $script:StartTime -Format Write
+                        'Time ' = Format-DateTime $script:StartTime -Format Write
                         'Computer' = $env:COMPUTERNAME
                         'User' = [Security.Principal.WindowsIdentity]::GetCurrent().Name
                     } | & $script:ExportData -Name $section -IsSummary
@@ -308,8 +308,28 @@ function Get-ActiveDirectory {
                     & $script:HandleError $section "Failed gathering $section"
                 }
             }
+
+            'DOMAIN CONTROLLERS' = { # Domain topology
+                Write-Console -Message "$section" -Type info        
+                try {
+                    $DCs = Get-ADDomainController -Filter * | 
+                        Select-Object HostName, Name, OperatingSystem, OperatingSystemVersion, 
+                                    ComputerObjectDN, IsGlobalCatalog, IPv4Address |
+                        & $script:ExportData -Name "$section"
+
+                    $DCs | ForEach-Object {
+                        [ordered]@{
+                            'DC' = $_.HostName
+                            'Operating System' = $_.OperatingSystemVersion
+                        } | & $script:ExportData -Name $section -IsSummary
+                    }
+
+                } catch {
+                    & $script:HandleError $section "Failed gathering $section"
+                }
+            }
     
-            'FSMO' = {  # FSMO role holders
+            'FSMO ROLES' = {  # FSMO role holders
                 Write-Console -Message "FSMO" -Type info
                 try {
                     @{
@@ -352,7 +372,7 @@ function Get-ActiveDirectory {
                 }
             }
    
-            'PASSPWORD_POLICY' = { # Domain password policy
+            'PASSPWORD POLICY' = { # Domain password policy
                 Write-Console -Message "$section" -Type info
                 
                 try {
@@ -404,7 +424,7 @@ function Get-ActiveDirectory {
                 }
             }
     
-            'PARTITION_BACKUPS' = { 
+            'PARTITION BACKUPS' = { 
                 Write-Console -Message "$section" -Type info
                 
                 try {
@@ -425,7 +445,7 @@ function Get-ActiveDirectory {
                                 [PSCustomObject]@{
                                     Type = $partitionType
                                     DN = $_
-                                    'LastBackup (UTC)' = Format-DateTime $lastBackup -Format Write
+                                    'LastBackup ' = Format-DateTime $lastBackup -Format Write
                                     BackupsDays = if ($lastBackup) {
                                         [math]::Round((New-TimeSpan -Start $lastBackup).TotalDays, 1)
                                     } else { "Never" }
@@ -433,7 +453,7 @@ function Get-ActiveDirectory {
                                 }
                     } | & $script:ExportData -Name $section -IsSummary  
                 } catch {
-                    & $script:HandleError $section "Failed to gather partitions"
+                    & $script:HandleError $section "Failed gathering $section"
                 }
             }
 
@@ -447,9 +467,9 @@ function Get-ActiveDirectory {
                         'Name' = $administrator.Name
                         'DistinguishedName' = $administrator.DistinguishedName
                         'Enabled' = $administrator.Enabled
-                        'LastLogonDate (UTC)' = Format-Value $administrator.LastLogonDate 
+                        'LastLogonDate ' = Format-Value $administrator.LastLogonDate 
                         'LogonAge (days)' = [math]::Round((New-TimeSpan -Start $administrator.LastLogonDate -End (Get-Date)).TotalDays)
-                        'PasswordLastSet (UTC)' = Format-Value $administrator.PasswordLastSet
+                        'PasswordLastSet ' = Format-Value $administrator.PasswordLastSet
                         'PasswordAge (days)' = [math]::Round((New-TimeSpan -Start $administrator.PasswordLastSet -End (Get-Date)).TotalDays)
                     } | & $script:ExportData -Name $section -IsSummary
                 } catch {
@@ -571,7 +591,6 @@ function Get-ActiveDirectory {
 
                         if ($members) {
                             $groups += $members
-                            Write-Log -Message "Added members to privileged collection" -Level DEBUG
                             
                             # Store statistics in a format usable for $script:ExportData 
                             @{
@@ -583,7 +602,7 @@ function Get-ActiveDirectory {
                             } | & $script:ExportData -Name $section -IsSummary
                         }
                     }
-                    Write-Log -Message "Starting matrix generation with $($accessPaths.Count) accounts" -Level DEBUG
+                    Write-Log -Message "Starting matrix with $($accessPaths.Count) accounts" -Level DEBUG
                     
                     # Privileged groups user matrix
                     $privilegedUsers = @()
@@ -592,12 +611,10 @@ function Get-ActiveDirectory {
                         $member = $groups | Where-Object SamAccountName -eq $account | Select-Object -First 1
                         
                         if ($null -eq $member) {
-                            Write-Log -Message "No member found for account $account" -Level WARN
                             continue
                         }
                         
                         if ($member.ObjectType -eq 'User') {
-                            Write-Log -Message "$($account) is 'User'" -Level DEBUG
                             $obj = [PSCustomObject]@{
                                 SamAccountName = $account
                                 ObjectType = "User"
@@ -615,7 +632,6 @@ function Get-ActiveDirectory {
                                 $obj | Add-Member -NotePropertyName $group -NotePropertyValue $value
                             }
                             
-                            Write-Log -Message "Adding obj to matrix" -Level DEBUG
                             $privilegedUsers += $obj
                         }
                     }
@@ -665,20 +681,20 @@ function Get-ActiveDirectory {
                         $users | & $script:ExportData -Name $section
 
                         # Calculate and export summary counts
-                        @{
+                        [ordered]@{
                             'Total' = ($users | Measure-Object).Count
-                            'Enabled' = ($users | Where-Object {$_.Enabled} | Measure-Object).Count
-                            'Disabled' = ($users | Where-Object {-not $_.Enabled} | Measure-Object).Count
+                            'Enabled' = ($users | Where-Object {$_.Enabled}).Count
+                            'Disabled' = ($users | Where-Object {-not $_.Enabled}).Count
                             'Stale' = ($users | Where-Object {
                                 $_.LastLogonDate -and $_.PasswordLastSet -and 
                                 ((New-TimeSpan -Start $_.LastLogonDate -End (Get-Date)).TotalDays -ge $script:LogonAge) -and
                                 ((New-TimeSpan -Start $_.PasswordLastSet -End (Get-Date)).TotalDays -ge $script:PasswordAge)
-                            } | Measure-Object).Count
-                            'PASSWD_NOTREQD' = ($users | Where-Object {$_.UserAccountControl -band 0x0020} | Measure-Object).Count
-                            'ENCRYPTED_TEXT_PWD_ALLOWED' = ($users | Where-Object {$_.UserAccountControl -band 0x0080} | Measure-Object).Count
-                            'PASSWD_CANT_CHANGE' = ($users | Where-Object {$_.UserAccountControl -band 0x0040} | Measure-Object).Count
-                            'DONT_REQUIRE_PREAUTH' = ($users | Where-Object {$_.UserAccountControl -band 0x400000} | Measure-Object).Count
-                            'USE_DES_KEY_ONLY' = ($users | Where-Object {$_.UserAccountControl -band 0x200000} | Measure-Object).Count
+                            } ).Count
+                            'PASSWD_NOTREQD' = ($users | Where-Object {$_.UserAccountControl -band 0x0020}).Count
+                            'ENCRYPTED_TEXT_PWD_ALLOWED' = ($users | Where-Object {$_.UserAccountControl -band 0x0080}).Count
+                            'PASSWD_CANT_CHANGE' = ($users | Where-Object {$_.UserAccountControl -band 0x0040}).Count
+                            'DONT_REQUIRE_PREAUTH' = ($users | Where-Object {$_.UserAccountControl -band 0x400000}).Count
+                            'USE_DES_KEY_ONLY' = ($users | Where-Object {$_.UserAccountControl -band 0x200000}).Count
                         } | & $script:ExportData -Name $section -IsSummary
                     } else {
                         @{
@@ -686,7 +702,7 @@ function Get-ActiveDirectory {
                         } | & $script:ExportData -Name $section -IsSummary
                     }
                 } catch {
-                    & $script:HandleError $section "Failed to gather user objects"
+                    & $script:HandleError $section "Failed gathering $section"
                 }
             }
 
@@ -750,7 +766,7 @@ function Get-ActiveDirectory {
                         } | & $script:ExportData -Name $section
                     }
                 } catch {
-                    & $script:HandleError $section "Failed to gather Kerberos delegation"
+                    & $script:HandleError $section "Failed gathering $section"
                 }
             }
 
@@ -777,7 +793,7 @@ function Get-ActiveDirectory {
                         } | & $script:ExportData -Name $section -IsSummary
                     }
                 } catch {
-                    & $script:HandleError $section "Failed to scan for GPP passwords"
+                    & $script:HandleError $section "Failed gathering $section"
                 }
             }
     
@@ -813,7 +829,7 @@ function Get-ActiveDirectory {
                         }
                     } | & $script:ExportData -Name $section -Description "Print Spooler"
                 } catch {
-                    & $script:HandleError $section "Failed checking print spooler"
+                    & $script:HandleError $section "Failed gathering $section"
                 }
             }
     
@@ -845,8 +861,8 @@ function Get-ActiveDirectory {
                             [PSCustomObject]@{
                                 Name = $_.Name
                                 Type = "sMSA"
-                                'Created (UTC)' = Format-DateTime $_.Created -Format Write
-                                'Modified (UTC)' = Format-DateTime $_.Modified -Format Write
+                                'Created ' = Format-DateTime $_.Created -Format Write
+                                'Modified ' = Format-DateTime $_.Modified -Format Write
                                 HostName = $_.DNSHostName
                                 Enabled = $_.Enabled
                                 Computers = $hostComputers -join '; '
@@ -874,7 +890,7 @@ function Get-ActiveDirectory {
                         [PSCustomObject]@{
                             Name = "No Managed Service Accounts Found"
 
-                        } | & $script:ExportData -Name "$section-No_MSAs_Found"
+                        } | & $script:ExportData -Name "$section-None-Found"
                     }
 
                     # Generate summary statistics
@@ -885,7 +901,7 @@ function Get-ActiveDirectory {
                     } | & $script:ExportData -Name $section -IsSummary
 
                 } catch {
-                    & $script:HandleError $section "Failed to gather managed service accounts"
+                    & $script:HandleError $section "Failed gathering $section"
                 }
             }
     
@@ -922,7 +938,7 @@ function Get-ActiveDirectory {
                         }
                         else {
                             [PSCustomObject]@{
-                            } | & $script:ExportData -Name "$section-No-PrivilegedSPNs"
+                            } | & $script:ExportData -Name "$section-None-Found"
                         }
 
                         # Export duplicate findings if any exist
@@ -953,7 +969,7 @@ function Get-ActiveDirectory {
                     } | & $script:ExportData -Name $section -IsSummary
 
                 } catch {
-                    & $script:HandleError $section "Failed to gather Service Principal Names"
+                    & $script:HandleError $section "Failed gathering $section"
                 }
             }
 
@@ -1005,7 +1021,7 @@ function Get-ActiveDirectory {
                         } | & $script:ExportData -Name $section -IsSummary
                     }
                 } catch {
-                    & $script:HandleError $section "Failed to query fine-grained password policies"
+                    & $script:HandleError $section "Failed gathering $section"
                 }
             }
 
@@ -1065,7 +1081,7 @@ function Get-ActiveDirectory {
                         } | & $script:ExportData -Name $section -IsSummary
                     }
                 } catch {
-                    & $script:HandleError $section "Failed to collect SYSVOL permissions"
+                    & $script:HandleError $section "Failed gathering $section"
                 }
             }
 
@@ -1118,99 +1134,98 @@ function Get-ActiveDirectory {
                         } | & $script:ExportData -Name $section -IsSummary
                     }
                 } catch {
-                    & $script:HandleError $section "Failed to gather computer objects"
+                    & $script:HandleError $section "Failed gathering $section"
                 }
             }
 
             'LOGGING' = { # Security audit policy settings
-            Write-Console -Message "LOGGING"
+                Write-Console -Message "LOGGING"
             
-            try {
-                # Initialize Windows API
-                $dll = [string]::Join("`r`n", '[DllImport("advapi32.dll")]', 'public static extern bool') 
-                $auditpol = Add-Type -Name 'AuditPol' -Namespace 'Win32' -PassThru -MemberDefinition "
-                    $dll AuditEnumerateCategories(out IntPtr catList, out uint count);
-                    $dll AuditLookupCategoryName(Guid catGuid, out string catName);
-                    $dll AuditEnumerateSubCategories(Guid catGuid, bool all, out IntPtr subList, out uint count);
-                    $dll AuditLookupSubCategoryName(Guid subGuid, out String subName);
-                    $dll AuditQuerySystemPolicy(Guid subGuid, uint count, out IntPtr policy);
-                    $dll AuditFree(IntPtr buffer);"
+                try {
+                    # Initialize Windows API
+                    $dll = [string]::Join("`r`n", '[DllImport("advapi32.dll")]', 'public static extern bool') 
+                    $auditpol = Add-Type -Name 'AuditPol' -Namespace 'Win32' -PassThru -MemberDefinition "
+                        $dll AuditEnumerateCategories(out IntPtr catList, out uint count);
+                        $dll AuditLookupCategoryName(Guid catGuid, out string catName);
+                        $dll AuditEnumerateSubCategories(Guid catGuid, bool all, out IntPtr subList, out uint count);
+                        $dll AuditLookupSubCategoryName(Guid subGuid, out String subName);
+                        $dll AuditQuerySystemPolicy(Guid subGuid, uint count, out IntPtr policy);
+                        $dll AuditFree(IntPtr buffer);"
 
-                Add-Type -TypeDefinition "
-                    using System;
-                    public struct AUDIT_POLICY_INFORMATION {
-                        public Guid AuditSubCategoryGuid;
-                        public UInt32 AuditingInformation;
-                        public Guid AuditCategoryGuid;
-                    }"
+                    Add-Type -TypeDefinition "
+                        using System;
+                        public struct AUDIT_POLICY_INFORMATION {
+                            public Guid AuditSubCategoryGuid;
+                            public UInt32 AuditingInformation;
+                            public Guid AuditCategoryGuid;
+                        }"
 
-                # Get policies
-                function Get-PolicyInfo($sub) {
-                    $pol = new-object AUDIT_POLICY_INFORMATION
-                    $size = $ms::SizeOf($pol)
-                    $ptr = $ms::AllocHGlobal($size)
-                    $null = $ms::StructureToPtr($pol, $ptr, $false)
-                    $null = $auditpol::AuditQuerySystemPolicy($sub, 1, [ref]$ptr)
-                    $pol = $ms::PtrToStructure($ptr, [type][AUDIT_POLICY_INFORMATION])
-                    $null = $ms::FreeHGlobal($ptr)
-                    [PsCustomObject]@{
-                        category = $pol.AuditCategoryGuid
-                        success = [bool]($pol.AuditingInformation -band 1)
-                        failure = [bool]($pol.AuditingInformation -band 2)
+                    # Get policies
+                    function Get-PolicyInfo($sub) {
+                        $pol = new-object AUDIT_POLICY_INFORMATION
+                        $size = $ms::SizeOf($pol)
+                        $ptr = $ms::AllocHGlobal($size)
+                        $null = $ms::StructureToPtr($pol, $ptr, $false)
+                        $null = $auditpol::AuditQuerySystemPolicy($sub, 1, [ref]$ptr)
+                        $pol = $ms::PtrToStructure($ptr, [type][AUDIT_POLICY_INFORMATION])
+                        $null = $ms::FreeHGlobal($ptr)
+                        [PsCustomObject]@{
+                            category = $pol.AuditCategoryGuid
+                            success = [bool]($pol.AuditingInformation -band 1)
+                            failure = [bool]($pol.AuditingInformation -band 2)
+                        }
                     }
-                }
 
-                # Get categories
-                $ms = [System.Runtime.InteropServices.Marshal]
-                $count = [uint32]0
-                $buffer = [IntPtr]::Zero
-                $size = $ms::SizeOf([type][guid])
-                $null = $auditpol::AuditEnumerateCategories([ref]$buffer,[ref]$count)
-                $ptr = [int64]$buffer
-                $name = [System.Text.StringBuilder]::new()
-                $catList = @{}
-                foreach($id in 1..$count) {
-                    $guid = $ms::PtrToStructure([IntPtr]$ptr,[type][guid])
-                    $null = $auditpol::AuditLookupCategoryName($guid,[ref]$name)
-                    $catList[$guid] = $name
-                    $ptr += $size
-                }
-                $null = $auditpol::AuditFree($buffer)
+                    # Get categories
+                    $ms = [System.Runtime.InteropServices.Marshal]
+                    $count = [uint32]0
+                    $buffer = [IntPtr]::Zero
+                    $size = $ms::SizeOf([type][guid])
+                    $null = $auditpol::AuditEnumerateCategories([ref]$buffer,[ref]$count)
+                    $ptr = [int64]$buffer
+                    $name = [System.Text.StringBuilder]::new()
+                    $catList = @{}
+                    foreach($id in 1..$count) {
+                        $guid = $ms::PtrToStructure([IntPtr]$ptr,[type][guid])
+                        $null = $auditpol::AuditLookupCategoryName($guid,[ref]$name)
+                        $catList[$guid] = $name
+                        $ptr += $size
+                    }
+                    $null = $auditpol::AuditFree($buffer)
 
-                # Get subcategories
-                $guid = [guid]::Empty
-                $null = $auditpol::AuditEnumerateSubCategories($guid, $true, [ref]$buffer, [ref]$count)
-                $ptr = [int64]$buffer
-                $results = @()
-                foreach($id in 1..$count) {
-                    $guid = $ms::PtrToStructure([IntPtr]$ptr,[type][guid])
-                    $null = $auditpol::AuditLookupSubCategoryName($guid,[ref]$name)
-                    $pol = Get-PolicyInfo $guid
+                    # Get subcategories
+                    $guid = [guid]::Empty
+                    $null = $auditpol::AuditEnumerateSubCategories($guid, $true, [ref]$buffer, [ref]$count)
+                    $ptr = [int64]$buffer
+                    $results = @()
+                    foreach($id in 1..$count) {
+                        $guid = $ms::PtrToStructure([IntPtr]$ptr,[type][guid])
+                        $null = $auditpol::AuditLookupSubCategoryName($guid,[ref]$name)
+                        $pol = Get-PolicyInfo $guid
+                        
+                        $results += [PSCustomObject]@{
+                            Category = $catList[$pol.category]
+                            Subcategory = $name.ToString()
+                            Success = $pol.success
+                            Failure = $pol.failure
+                        }
+                        $ptr += $size
+                    }
+
+                    # Detailed export
+                    $results | & $script:ExportData -Name $section
                     
-                    $results += [PSCustomObject]@{
-                        Category = $catList[$pol.category]
-                        Subcategory = $name.ToString()
-                        Success = $pol.success
-                        Failure = $pol.failure
-                    }
-                    $ptr += $size
+                    # Summary export
+                    @{
+                        'Total' = ($results | Measure-Object).Count
+                        'Success' = ($results | Where-Object Success | Measure-Object).Count
+                        'Failure' = ($results | Where-Object Failure | Measure-Object).Count
+                    } | & $script:ExportData -Name $section -IsSummary
+                    
+                } catch {
+                    & $script:HandleError $section "Failed gathering $section"
                 }
-
-                # Detailed export
-                $results | & $script:ExportData -Name $section
-                
-                # Summary export
-                @{
-                    'Total' = ($results | Measure-Object).Count
-                    'Success' = ($results | Where-Object Success | Measure-Object).Count
-                    'Failure' = ($results | Where-Object Failure | Measure-Object).Count
-                } | & $script:ExportData -Name $section -IsSummary
-                
-            } catch {
-                & $script:HandleError $section "Failed to gather audit policies"
             }
-        }
-
         }
         
         # Process each section
