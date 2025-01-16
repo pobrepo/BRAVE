@@ -5,7 +5,6 @@
     Active Directory queries for the purpose of a BRAVE assessments.
     Includes automated evidence collection for Veeam Backup & Replication, as an alternative to screenshots.
 .NOTES
-    Version:        2.0.0
     Author:         Patrick O'Brien
     Date:           January 8, 2024
     Purpose:        Consolidation of 'Trimarc' and 'Composite' scripts with standardized output, naming, time format, error handling, message handling.
@@ -27,17 +26,19 @@ param(
         }
         return $true
     })]
-    [string]$OutputDirectory = "c:\temp\BRAVE\",
+    [string]$Version = "2.1.0",
     [string[]]$ModuleList = @('GroupPolicy'),
-    [string[]]$CertModule = @('PSPKI')
+    [string]$CertModule = "PSPKI",
+    [string]$OutputDirectory = "c:\temp\BRAVE\"
 )
 $ErrorActionPreference    = "SilentlyContinue"
 
-function Format-DateTime {
+#region Handlers
+function FormatValue {
     param(
         [Parameter(ValueFromPipeline)]
         [nullable[DateTime]]$DateTime = [DateTime]::UtcNow,
-        [ValidateSet('Write', 'File', 'ISO')]
+        [ValidateSet('Write', 'File')]
         [string]$Format = 'Write'
     )
 
@@ -51,6 +52,206 @@ function Format-DateTime {
     }
 }
 
+# Format handler
+$script:FormatValue = {
+    param(
+        [Parameter(ValueFromPipeline)]
+        $Value
+    )
+    
+    if ($null -eq $Value) { return '' }
+    
+    switch ($Value) {
+        { $_ -is [DateTime] } { return FormatValue -DateTime $_ -Format Write }
+        { $_ -is [TimeSpan] } { return $_.TotalDays }
+        default { return $_ }
+    }
+}
+
+# Recursive lookup handler
+$script:RecursiveMembers = {
+    param (
+        [string]$GroupSID,
+        [string]$GroupName,
+        [string]$SecurityGroup,
+        [string]$ParentPath = "",
+        [hashtable]$AccessPaths
+    )
+
+    try {
+        $results = @()
+        $members = Get-ADGroupMember -Identity $GroupSID -Server $script:ADDomain.PDCEmulator
+        
+        # Set current path
+        $currentPath = if ($ParentPath) {
+            "$ParentPath -> $GroupName"
+        } else {
+            $GroupName
+        }
+        
+        foreach ($member in $members) {
+            if ($member.objectClass -eq 'group') {
+                $nestedGroup = Get-ADGroup $member -Properties Enabled -Server $script:ADDomain.PDCEmulator
+                
+                # Add group to results
+                $results += [PSCustomObject]@{
+                    Name = $nestedGroup.Name
+                    SamAccountName = $nestedGroup.SamAccountName
+                    Group = $GroupName
+                    Enabled = $true
+                    LastLogonDate = $null
+                    PasswordLastSet = $null
+                    SPNs = ""
+                    ObjectType = "Group"
+                    NestedPath = $currentPath
+                    DistinguishedName = $nestedGroup.DistinguishedName
+                }
+                
+                # Process nested members
+                $nestedMembers = & $script:RecursiveMembers -GroupSID $nestedGroup.SID `
+                                                        -GroupName $nestedGroup.Name `
+                                                        -SecurityGroup $SecurityGroup `
+                                                        -ParentPath $currentPath `
+                                                        -AccessPaths $AccessPaths
+                
+                if ($nestedMembers) {
+                    $results += $nestedMembers
+                }
+            }
+            else {
+                $user = Get-ADUser $member -Properties LastLogonDate, PasswordLastSet, ServicePrincipalName, 
+                                        Enabled, DistinguishedName -Server $script:ADDomain.PDCEmulator
+                
+                # Add user to results
+                $results += [PSCustomObject]@{
+                    Name = $user.Name
+                    SamAccountName = $user.SamAccountName
+                    Group = $GroupName
+                    Enabled = $user.Enabled
+                    LastLogonDate = & $script:FormatValue $user.LastLogonDate
+                    PasswordLastSet = & $script:FormatValue $user.PasswordLastSet
+                    SPNs = $user.ServicePrincipalName -join ';'
+                    ObjectType = "User"
+                    NestedPath = $currentPath
+                    DistinguishedName = $user.DistinguishedName
+                }
+                
+                # Track user access path
+                if ($AccessPaths) {
+                    if (-not $AccessPaths.ContainsKey($user.SamAccountName)) {
+                        $AccessPaths[$user.SamAccountName] = @{}
+                    }
+
+                    $isDirect = $currentPath -eq $SecurityGroup
+
+                    if (-not ($AccessPaths[$user.SamAccountName].ContainsKey($SecurityGroup) -and 
+                        $AccessPaths[$user.SamAccountName][$SecurityGroup] -eq "Direct member")) {
+                        $AccessPaths[$user.SamAccountName][$SecurityGroup] = if ($isDirect) {
+                            "Direct member"
+                        } else {
+                            $currentPath
+                        }
+                    }
+                }
+            }
+        }
+        
+        return $results
+    }
+    catch {
+        Write-Log -Message "Error processing group $GroupName" -Level WARN -Exception $_
+        
+    }
+}
+
+# CSV export handler
+$script:Export = {
+    param (
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [object[]]$InputObject,
+        [Parameter(Mandatory)]
+        [string]$Name,
+        [string]$Description = $Name,
+        [switch]$IsSummary
+    )
+
+    begin {
+        $summaryData = [ordered]@{}  # Ordered hashtable
+        $detailedData = [System.Collections.ArrayList]@()
+    }
+
+    process {
+        foreach ($item in $InputObject) {
+            if ($item -is [hashtable] -or $item -is [System.Collections.Specialized.OrderedDictionary]) {
+                foreach ($key in $item.Keys) {
+                    $summaryData[$key] = & $script:FormatValue $item[$key]
+                }
+            } 
+            elseif ($item -is [PSCustomObject] -and $IsSummary) {
+                $item.PSObject.Properties | ForEach-Object {
+                    $summaryData[$_.Name] = & $script:FormatValue $_.Value
+                }
+            }
+            else {
+                if ($item -is [PSObject]) {
+                    $clonedItem = $item.PSObject.Copy()
+                    foreach ($prop in $clonedItem.PSObject.Properties) {
+                        $prop.Value = & $script:FormatValue $prop.Value
+                    }
+                    [void]$detailedData.Add($clonedItem)
+                } else {
+                    [void]$detailedData.Add($item)
+                }
+            }
+        }
+    }
+
+    end {
+        if ($summaryData.Count -gt 0 -or $IsSummary) {
+            $summaryPath = Join-Path $script:OutputDirectory "$($script:filename)-Summary.csv"
+            foreach ($key in $summaryData.Keys) {
+                "$Name,$key,$($summaryData[$key])" | Add-Content -Path $summaryPath
+            }
+        }
+
+        if ($detailedData.Count -gt 0 -and -not $IsSummary) {
+            $detailedPath = Join-Path $script:OutputDirectory "$($script:filename)-$Name.csv"
+            $detailedData | Export-Csv -Path $detailedPath -NoTypeInformation
+        }
+    }
+}
+
+# Error handler
+$script:ErrorHandler = {
+    param($Section, $Msg)
+    Write-Log -Message "$Section failed: $Msg" -Level ERROR
+    @{ "$Section" = "Failed: $Msg" } | & $script:Export -Name $Section -IsSummary
+}
+
+# Archive handler
+$script:Validate = {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+    
+    try {
+        # Expand zip for integrity check
+        $null = [System.IO.Compression.ZipFile]::OpenRead($Path)
+        return $true
+    }
+    catch {
+        Write-Log -Message "Archive validation failed: $_" -Level ERROR
+        return $false
+    }
+    finally {
+        if ($zip) { $zip.Dispose() }
+    }
+}
+#endregion Handlers
+
+#region Write
 function Write-Log {
     [CmdletBinding()]
     param (
@@ -63,7 +264,7 @@ function Write-Log {
     )
 
     # Create timestamp
-    $logMessage = "[$(Format-DateTime -Format Write)] [$Level] $Message"
+    $logMessage = "[$(FormatValue -Format Write)] [$Level] $Message"
     
     # Exception handling
     if ($Exception) {
@@ -78,18 +279,18 @@ function Write-Log {
     }
 
     try {
-        if ([string]::IsNullOrEmpty($script:LogFile)) {
-            throw "LogFile null or empty $($script:LogFile)"
+        if ([string]::IsNullOrEmpty($script:Log)) {
+            throw "Logfile null or empty $($script:Log)"
         }
         
         # Write to log file
-        $logMessage | Out-File -FilePath $script:LogFile -Append -Force -Encoding UTF8
+        $logMessage | Out-File -FilePath $script:Log -Append -Force -Encoding UTF8
 
     }
     catch {
         Write-Warning "Write-Log failed: $_"
         Write-Warning "Message: $logMessage"
-        Write-Warning "LogFile: $script:LogFile"
+        Write-Warning "Logfile: $script:Log"
     }
 }
 
@@ -141,7 +342,9 @@ function Write-Console {
         }
     }
 }
+#endregion Write
 
+#region Minimum Requirements
 # Check PowerShell version
 if ($PSVersionTable.PSVersion.Major -lt 5) {
     Write-Warning "PowerShell 5 or higher required. Current version: $($PSVersionTable.PSVersion)"
@@ -153,161 +356,57 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     Write-Warning "Script requires elevation. Run PowerShell with 'Run As Administrator'."
     throw
 }
+#endregion Minimum Requirements
 
-# Helper: Validate archive file
-function Test-Archive {
-    [CmdletBinding()]
-    param (
-        [Parameter(Mandatory)]
-        [string]$Path
-    )
-    
-    try {
-        # Expand zip for integrity check
-        $null = [System.IO.Compression.ZipFile]::OpenRead($Path)
-        return $true
-    }
-    catch {
-        Write-Log -Message "Archive validation failed: $_" -Level ERROR
-        return $false
-    }
-    finally {
-        if ($zip) { $zip.Dispose() }
-    }
-}
-
-function Get-ActiveDirectory {
+function Get-BRAVE {
     [CmdletBinding()]
     param()
     
-    Write-Console -Message "GATHERING ACTIVE DIRECTORY INFORMATION" -Type header
-
-    # Format helper
-    function Format-Value {
-        param(
-            [Parameter(ValueFromPipeline)]
-            $Value
-        )
-        
-        if ($null -eq $Value) { return '' }
-        
-        switch ($Value) {
-            { $_ -is [DateTime] } { return Format-DateTime -DateTime $_ -Format Write }
-            { $_ -is [TimeSpan] } { return $_.TotalDays }
-            default { return $_ }
-        }
-    }
-
-    # Export handler
-    $script:ExportData = {
-        param (
-            [Parameter(Mandatory, ValueFromPipeline)]
-            [object[]]$InputObject,
-            [Parameter(Mandatory)]
-            [string]$Name,
-            [string]$Description = $Name,
-            [switch]$IsSummary
-        )
-    
-        begin {
-            $summaryData = [ordered]@{}  # Change to ordered hashtable
-            $detailedData = [System.Collections.ArrayList]@()
-        }
-    
-        process {
-            foreach ($item in $InputObject) {
-                if ($item -is [hashtable] -or $item -is [System.Collections.Specialized.OrderedDictionary]) {
-                    foreach ($key in $item.Keys) {
-                        $summaryData[$key] = Format-Value $item[$key]
-                    }
-                } 
-                elseif ($item -is [PSCustomObject] -and $IsSummary) {
-                    $item.PSObject.Properties | ForEach-Object {
-                        $summaryData[$_.Name] = Format-Value $_.Value
-                    }
-                }
-                else {
-                    if ($item -is [PSObject]) {
-                        $clonedItem = $item.PSObject.Copy()
-                        foreach ($prop in $clonedItem.PSObject.Properties) {
-                            $prop.Value = Format-Value $prop.Value
-                        }
-                        [void]$detailedData.Add($clonedItem)
-                    } else {
-                        [void]$detailedData.Add($item)
-                    }
-                }
-            }
-        }
-    
-        end {
-            if ($summaryData.Count -gt 0 -or $IsSummary) {
-                $summaryPath = Join-Path $script:OutputDirectory "$($script:filename)-Summary.csv"
-                foreach ($key in $summaryData.Keys) {
-                    "$Name,$key,$($summaryData[$key])" | Add-Content -Path $summaryPath
-                }
-            }
-    
-            if ($detailedData.Count -gt 0 -and -not $IsSummary) {
-                $detailedPath = Join-Path $script:OutputDirectory "$($script:filename)-$Name.csv"
-                $detailedData | Export-Csv -Path $detailedPath -NoTypeInformation
-            }
-        }
-    }
-
-    # Error handler
-    $script:HandleError = {
-        param($Section, $Msg)
-        Write-Log -Message "$Section failed: $Msg" -Level ERROR
-        @{ "$Section" = "Failed: $Msg" } | & $script:ExportData -Name $Section -IsSummary
-    }
+    Write-Console -Message "QUERYING ACTIVE DIRECTORY" -Type header
 
     try {
         $controls = [Ordered]@{
-            
-            'RUNTIME' = { # Runtime environment
+                        
+            'RUNTIME' = {
                 try {
-                    $computerSystem = Get-CimInstance -ClassName Win32_ComputerSystem
-                    $domainStatus = if ($computerSystem.PartOfDomain) {
-                        "Domain Joined: $($computerSystem.Domain)"
-                    } else {
-                        "Workgroup: $($computerSystem.Workgroup)"
-                    }
+                    $system = Get-CimInstance -ClassName Win32_ComputerSystem
+                    $networkKey = if ($system.PartOfDomain) {'Domain-joined'} else {'Workgroup-joined'}
+                    $networkValue = if ($system.PartOfDomain) {$system.Domain} else {$system.Workgroup}
 
-                    @{
-                        'Time ' = Format-DateTime $script:StartTime -Format Write
+                    [Ordered]@{
+                        'Time ' = FormatValue $script:StartTime -Format Write
                         'Computer' = $env:COMPUTERNAME
+                        $networkKey = $networkValue
                         'User' = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-                        'Operating System' = (Get-CimInstance -ClassName Win32_OperatingSystem).Caption
-                        'Domain Status' = $domainStatus
-                        'PSCommandPath' = $PSCommandPath
-                        'MyInvocation.Line' = $MyInvocation.Line
-                        'MyInvocation.MyCommand.Path' = $MyInvocation.MyCommand.Path
-                        'MyInvocation.MyCommand.Name' = $MyInvocation.MyCommand.Name
-                        'Host.Name' = $Host.Name
-                    } | & $script:ExportData -Name $section -IsSummary
+                        'OS' = (Get-CimInstance -ClassName Win32_OperatingSystem).Caption
+                        'PowerShell Application' = $Host.Name
+                        'PowerShell Path ($PSCommandPath)' = $PSCommandPath
+                        'PowerShell Path ($MyInvocation)' = $MyInvocation.MyCommand.Path
+                        'PowerShell Command' = $MyInvocation.MyCommand.Name
+                        
+                    } | & $script:Export -Name $section -IsSummary
                 } catch {
-                    & $script:HandleError $section "Failed gathering $section"
+                    & $script:ErrorHandler $section "Failed gathering $section"
                 }
             }
-    
-            'FOREST' = { # Forest topology
+
+            'FOREST' = {
                 Write-Console -Message "$section" -Type info
                 try {
-                    @{
+                    [Ordered]@{
                         'Name' = $script:ADForest.Name
                         'Mode' = $script:ADForest.ForestMode
                         'RootDomain' = $script:ADForest.RootDomain
                         'Domains' = $script:ADForest.Domains.Count
                         'Sites' = $script:ADForest.Sites.Count
                         'GCs' = $script:ADForest.GlobalCatalogs.Count
-                    } | & $script:ExportData -Name $section -IsSummary
+                    } | & $script:Export -Name $section -IsSummary # Pipe to supress console output
                 } catch {
-                    & $script:HandleError $section "Failed gathering $section"
+                    & $script:ErrorHandler $section "Failed gathering $section"
                 }
             }
     
-            'DOMAIN' = { # Domain topology
+            'DOMAIN' = {
                 Write-Console -Message "$section" -Type info        
                 try {
                      @{ 
@@ -317,38 +416,80 @@ function Get-ActiveDirectory {
                         'SID' = $script:ADDomain.DomainSID.Value
                         'DCs' = $script:ADDomain.ReplicaDirectoryServers.Count
                         'RODCs' = $script:ADDomain.ReadOnlyReplicaDirectoryServers.Count
-                    } | & $script:ExportData -Name $section -IsSummary
+                    } | & $script:Export -Name $section -IsSummary # Pipe to supress console output
                 } catch {
-                    & $script:HandleError $section "Failed gathering $section"
+                    & $script:ErrorHandler $section "Failed gathering $section"
                 }
             }
 
-            'DOMAIN CONTROLLERS' = { # Domain topology
+            'BACKUP' = { 
+                Write-Console -Message "$section" -Type info
+                
+                try {
+                    $rootDSE = Get-ADRootDSE -Server $script:ADDomain.PDCEmulator
+                    $partitions = $rootDSE.namingContexts
+
+                    foreach ($partition in $partitions) {
+                        $partitionMetadata = Get-ADReplicationAttributeMetadata -Object $partition `
+                            -Properties dSASignature -Server $script:ADDomain.PDCEmulator
+                        
+                        $partitionBackup = $partitionMetadata | Select-Object -ExpandProperty LastOriginatingChangeTime
+                        
+                        $partitionContext = switch -Regex ($partition) {
+                            "CN=Schema," { "Schema" }
+                            "CN=Configuration," { "Configuration" }
+                            "DC=DomainDnsZones," { "Domain DNS Zones" }
+                            "DC=ForestDnsZones," { "Forest DNS Zones" }
+                            "DC=.*" { "Domain" }
+                            default { "Unknown" }
+                        }
+
+                        [ordered]@{ # Export detailed
+                            'Type' = $partitionContext
+                            'DN' = $partition
+                            'LastBackup' = FormatValue $partitionBackup -Format Write
+                            'Age (day)' = if ($partitionBackup) {
+                                [math]::Round((New-TimeSpan -Start $partitionBackup).TotalDays, 2)
+                            } else { "Never" }
+                        } | & $script:Export -Name $section # Pipe to supress console output
+
+                        [ordered]@{ # Exprot summary
+                            'Partition' = $partitionContext
+                            'Last Backup' = FormatValue $partitionBackup -Format Write
+                            'Age (day)' = if ($partitionBackup) {
+                                [math]::Round((New-TimeSpan -Start $partitionBackup).TotalDays, 2)
+                            } else { "Never" }
+                        } | & $script:Export -Name $section -IsSummary # Pipe to supress console output
+                    }
+
+                } catch {
+                    & $script:ErrorHandler $section "Failed gathering $section"
+                }
+            }
+
+            'DCs' = {
                 Write-Console -Message "$section" -Type info        
                 try {
-                    # Store DC data first
                     $DCs = Get-ADDomainController -Filter * | 
-                        Select-Object HostName, Name, OperatingSystem, OperatingSystemVersion, 
-                                    ComputerObjectDN, IsGlobalCatalog, IPv4Address
+                        Select-Object HostName, Name, Enabled, OperationMasterRoles, OperatingSystem, OperatingSystemVersion, 
+                                    ComputerObjectDN, IsGlobalCatalog, IsReadOnly, IPv4Address
                 
-                    # Export detailed data
-                    $DCs | & $script:ExportData -Name "$section"
+                    $DCs | & $script:Export -Name "$section" # Export details
                 
-                    # Export summary data
-                    foreach ($dc in $DCs) {
+                    foreach ($dc in $DCs) { # Export summary
                         [ordered]@{
-                            'DC' = $dc.HostName
-                            'Operating System' = $dc.OperatingSystemVersion
-                        } | & $script:ExportData -Name $section -IsSummary
+                            'Host' = $dc.HostName
+                            'OS' = $dc.OperatingSystem
+                        } | & $script:Export -Name $section -IsSummary
                     }
                 
                 } catch {
-                    & $script:HandleError $section "Failed gathering $section"
+                    & $script:ErrorHandler $section "Failed gathering $section"
                 }
             }
     
-            'FSMO ROLES' = {  # FSMO role holders
-                Write-Console -Message "FSMO" -Type info
+            'FSMO' = {
+                Write-Console -Message "$section" -Type info
                 try {
                     @{
                         'Schema' = $script:ADForest.SchemaMaster
@@ -356,13 +497,13 @@ function Get-ActiveDirectory {
                         'PDC' = $script:ADDomain.PDCEmulator
                         'RID' = $script:ADDomain.RIDMaster
                         'Infra' = $script:ADDomain.InfrastructureMaster
-                    } | & $script:ExportData -Name $section -IsSummary
+                    } | & $script:Export -Name $section -IsSummary
                 } catch {
-                    & $script:HandleError $section "Failed gathering $section"
+                    & $script:ErrorHandler $section "Failed gathering $section"
                 }
             }
-            
-            'TRUSTS' = { # Domain trusts
+
+            'TRUSTS' = {
                 Write-Console -Message "$section" -Type info
                 
                 try {
@@ -377,105 +518,20 @@ function Get-ActiveDirectory {
                             'Outbound' = ($trusts | Where-Object { $_.Direction -in 'Outbound','Bidirectional' } | Measure-Object).Count
                             'BiDirectional' = ($trusts | Where-Object { $_.Direction -eq 'Bidirectional' } | Measure-Object).Count
                             'TrustedDomains' = ($trusts.Target | Sort-Object) -join '; '
-                        } | & $script:ExportData -Name $section -IsSummary # Pipe to supress console output
+                        } | & $script:Export -Name $section -IsSummary 
 
-                        $trusts | & $script:ExportData -Name $section
+                        $trusts | & $script:Export -Name $section
                     } else {
                         [PSCustomObject]@{
                             Status = "No trusts found"
-                        } | & $script:ExportData -Name "$section-NONE-FOUND" # Pipe to supress console output
+                        } | & $script:Export -Name "$section-NONE-FOUND" # Pipe to supress console output
                     }
                 } catch {
-                    & $script:HandleError $section "Failed gathering $section"
-                }
-            }
-   
-            'PASSPWORD POLICY' = { # Domain password policy
-                Write-Console -Message "$section" -Type info
-                
-                try {
-                    $policy = Get-ADDefaultDomainPasswordPolicy -Server $script:ADDomain.PDCEmulator
-                    
-                    @{
-                        'ComplexityEnabled' = $policy.ComplexityEnabled
-                        'MinPasswordLength' = $policy.MinPasswordLength
-                        'MaxPasswordAge (day)' = $policy.MaxPasswordAge.TotalDays
-                        'MinPasswordAge (day)' = $policy.MinPasswordAge.TotalDays
-                        'LockoutThreshold' = $policy.LockoutThreshold
-                        'LockoutDuration (min)' = $policy.LockoutDuration.TotalMinutes
-                        'PasswordHistoryCount' = $policy.PasswordHistoryCount
-                        'ReversibleEncryptionEnabled' = $policy.ReversibleEncryptionEnabled
-                    } | & $script:ExportData -Name $section -IsSummary
-                } catch {
-                    & $script:HandleError $section "Failed gathering $section"
-                }
-            }
-    
-            'TOMBSTONE' = { # Directory service tombstone
-                Write-Console -Message "$section" -Type info
-                
-                try {
-                    $tombstone = Get-ADObject -Identity "CN=Directory Service,CN=Windows NT,CN=Services,$((Get-ADRootDSE).configurationNamingContext)" `
-                        -Properties tombstoneLifetime -Server $script:ADDomain.PDCEmulator
-                    
-                    @{
-                        'TombstoneLifetime (day)' = [int]$tombstone.tombstoneLifetime
-                    } | & $script:ExportData -Name $section -IsSummary
-                } catch {
-                    & $script:HandleError $section "Failed gathering $section"
-                }
-            }
-    
-            'DSHEURISTICS' = { # Directory Service behavior
-                Write-Console -Message "$section" -Type info
-                
-                try {
-                    $configNC = (Get-ADRootDSE).configurationNamingContext
-                    $dsService = Get-ADObject -Filter 'objectClass -eq "nTDSService"' `
-                        -SearchBase $configNC -Properties dSHeuristics -Server $script:ADDomain.PDCEmulator
-                    
-                    @{
-                        'Value' = if ($dsService.dSHeuristics) { $dsService.dSHeuristics } else { "Not Set" }
-                    } | & $script:ExportData -Name $section -IsSummary
-                } catch {
-                    & $script:HandleError $section "Failed gathering $section"
-                }
-            }
-    
-            'PARTITION BACKUPS' = { 
-                Write-Console -Message "$section" -Type info
-                
-                try {
-                    $contexts = (Get-ADRootDSE -Server $script:ADDomain.PDCEmulator).namingContexts
-                    
-                    $contexts | ForEach-Object {
-                            $partitionType = switch -Regex ($_) {
-                                "CN=Schema," { "Schema" }
-                                "CN=Configuration," { "Config" }
-                                "DC=.*" { "Domain" }
-                                default { "Unknown" }
-                            }
-        
-                            $lastBackup = Get-ADReplicationAttributeMetadata -Object $_ `
-                                -Properties dSASignature -Server $script:ADDomain.PDCEmulator |
-                                Select-Object -ExpandProperty LastOriginatingChangeTime
-                            
-                                [PSCustomObject]@{
-                                    Type = $partitionType
-                                    DN = $_
-                                    'LastBackup ' = Format-DateTime $lastBackup -Format Write
-                                    BackupsDays = if ($lastBackup) {
-                                        [math]::Round((New-TimeSpan -Start $lastBackup).TotalDays, 1)
-                                    } else { "Never" }
-                                    IsSummary = $true
-                                }
-                    } | & $script:ExportData -Name $section -IsSummary  
-                } catch {
-                    & $script:HandleError $section "Failed gathering $section"
+                    & $script:ErrorHandler $section "Failed gathering $section"
                 }
             }
 
-            'DEFAULT_ADMINISTRATOR' = {
+            'SID500' = {
                 Write-Console -Message "$section" -Type info
                 
                 try {
@@ -485,114 +541,19 @@ function Get-ActiveDirectory {
                         'Name' = $administrator.Name
                         'DistinguishedName' = $administrator.DistinguishedName
                         'Enabled' = $administrator.Enabled
-                        'LastLogonDate ' = Format-Value $administrator.LastLogonDate 
+                        'LastLogonDate ' = & $script:FormatValue $administrator.LastLogonDate 
                         'LogonAge (days)' = [math]::Round((New-TimeSpan -Start $administrator.LastLogonDate -End (Get-Date)).TotalDays)
-                        'PasswordLastSet ' = Format-Value $administrator.PasswordLastSet
+                        'PasswordLastSet ' = & $script:FormatValue $administrator.PasswordLastSet
                         'PasswordAge (days)' = [math]::Round((New-TimeSpan -Start $administrator.PasswordLastSet -End (Get-Date)).TotalDays)
-                    } | & $script:ExportData -Name $section -IsSummary
+                    } | & $script:Export -Name $section -IsSummary
                 } catch {
-                    & $script:HandleError $section "Failed gathering $section"
+                    & $script:ErrorHandler $section "Failed gathering $section"
                 }
             }
 
             'PRIVILEGED' = {
                 Write-Console -Message "$section" -Type info
                 
-                function Get-RecursiveGroupMember {
-                    param (
-                        [string]$GroupSID,
-                        [string]$GroupName,
-                        [string]$SecurityGroup,
-                        [string]$ParentPath = "",
-                        [hashtable]$AccessPaths
-                    )
-                
-                    try {
-                        $results = @()
-                        $members = Get-ADGroupMember -Identity $GroupSID -Server $script:ADDomain.PDCEmulator
-                        
-                        # Set current path
-                        $currentPath = if ($ParentPath) {
-                            "$ParentPath -> $GroupName"
-                        } else {
-                            $GroupName
-                        }
-                        
-                        foreach ($member in $members) {
-                            if ($member.objectClass -eq 'group') {
-                                $nestedGroup = Get-ADGroup $member -Properties Enabled -Server $script:ADDomain.PDCEmulator
-                                
-                                # Add group to results
-                                $results += [PSCustomObject]@{
-                                    Name = $nestedGroup.Name
-                                    SamAccountName = $nestedGroup.SamAccountName
-                                    Group = $GroupName
-                                    Enabled = $true
-                                    LastLogonDate = $null
-                                    PasswordLastSet = $null
-                                    SPNs = ""
-                                    ObjectType = "Group"
-                                    NestedPath = $currentPath
-                                    DistinguishedName = $nestedGroup.DistinguishedName
-                                }
-                                
-                                # Process nested members
-                                $nestedMembers = Get-RecursiveGroupMember -GroupSID $nestedGroup.SID `
-                                                                        -GroupName $nestedGroup.Name `
-                                                                        -SecurityGroup $SecurityGroup `
-                                                                        -ParentPath $currentPath `
-                                                                        -AccessPaths $AccessPaths
-                                
-                                if ($nestedMembers) {
-                                    $results += $nestedMembers
-                                }
-                            }
-                            else {
-                                $user = Get-ADUser $member -Properties LastLogonDate, PasswordLastSet, ServicePrincipalName, 
-                                                        Enabled, DistinguishedName -Server $script:ADDomain.PDCEmulator
-                                
-                                # Add user to results
-                                $results += [PSCustomObject]@{
-                                    Name = $user.Name
-                                    SamAccountName = $user.SamAccountName
-                                    Group = $GroupName
-                                    Enabled = $user.Enabled
-                                    LastLogonDate = Format-Value $user.LastLogonDate
-                                    PasswordLastSet = Format-Value $user.PasswordLastSet
-                                    SPNs = $user.ServicePrincipalName -join ';'
-                                    ObjectType = "User"
-                                    NestedPath = $currentPath
-                                    DistinguishedName = $user.DistinguishedName
-                                }
-                                
-                                # Track access path for user
-                                if ($AccessPaths) {
-                                    if (-not $AccessPaths.ContainsKey($user.SamAccountName)) {
-                                        $AccessPaths[$user.SamAccountName] = @{}
-                                    }
-
-                                    $isDirect = $currentPath -eq $SecurityGroup
-
-                                    if (-not ($AccessPaths[$user.SamAccountName].ContainsKey($SecurityGroup) -and 
-                                        $AccessPaths[$user.SamAccountName][$SecurityGroup] -eq "Direct member")) {
-                                        $AccessPaths[$user.SamAccountName][$SecurityGroup] = if ($isDirect) {
-                                            "Direct member"
-                                        } else {
-                                            $currentPath
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        
-                        return $results
-                    }
-                    catch {
-                        Write-Log -Message "Error processing group $GroupName" -Level WARN -Exception $_
-                        
-                    }
-                }
-
                 try {
                     # Initialize tracking
                     $groups = @()
@@ -601,7 +562,7 @@ function Get-ActiveDirectory {
                     foreach ($group in $script:PrivilegedGroups.GetEnumerator()) {
                         Write-Log -Message "Processing: $($group.Key), SID: $($group.Value)" -Level DEBUG
                         
-                        $members = Get-RecursiveGroupMember -GroupSID $group.Value `
+                        $members = & $script:RecursiveMembers -GroupSID $group.Value `
                                                           -GroupName $group.Key `
                                                           -SecurityGroup $group.Key `
                                                           -AccessPaths $accessPaths
@@ -610,20 +571,20 @@ function Get-ActiveDirectory {
                         if ($members) {
                             $groups += $members
                             
-                            # Store statistics in a format usable for $script:ExportData 
+                            # Store statistics in a format usable for $script:Export 
                             @{
                                 "$($group.Key) Total" = ($members | Where-Object ObjectType -eq 'User' | Sort-Object -Unique SamAccountName).Count
-                               } | & $script:ExportData -Name $section -IsSummary
+                               } | & $script:Export -Name $section -IsSummary
             
                             @{
                                 "$($group.Key) Disabled" = ($members | Where-Object { $_.ObjectType -eq 'User' -and -not $_.Enabled } | Sort-Object -Unique SamAccountName).Count
-                            } | & $script:ExportData -Name $section -IsSummary
+                            } | & $script:Export -Name $section -IsSummary
                         }
                     }
-                    Write-Log -Message "Starting matrix with $($accessPaths.Count) accounts" -Level DEBUG
+                    Write-Log -Message "Creating matrix for $($accessPaths.Count) accounts" -Level DEBUG
                     
-                    # Privileged groups user matrix
-                    $privilegedUsers = @()
+                    # Privileged user matrix
+                    $script:PrivilegedUsers = @()
                     foreach ($account in $accessPaths.Keys | Sort-Object) {
                         Write-Log -Message "Processing account: $account" -Level DEBUG
                         $member = $groups | Where-Object SamAccountName -eq $account | Select-Object -First 1
@@ -637,8 +598,8 @@ function Get-ActiveDirectory {
                                 SamAccountName = $account
                                 ObjectType = "User"
                                 Enabled = $member.Enabled
-                                LastLogonDate = Format-Value $member.LastLogonDate
-                                PasswordLastSet = Format-Value $member.PasswordLastSet
+                                LastLogonDate = & $script:FormatValue $member.LastLogonDate
+                                PasswordLastSet = & $script:FormatValue $member.PasswordLastSet
                             }
                             
                             foreach ($group in $script:PrivilegedGroups.Keys) {
@@ -650,7 +611,7 @@ function Get-ActiveDirectory {
                                 $obj | Add-Member -NotePropertyName $group -NotePropertyValue $value
                             }
                             
-                            $privilegedUsers += $obj
+                            $script:PrivilegedUsers += $obj
                         }
                     }
             
@@ -660,7 +621,7 @@ function Get-ActiveDirectory {
                             'Category' = $section
                             'Setting' = $key
                             'Value' = $summary[$key]
-                        } | & $script:ExportData -Name $section -IsSummary
+                        } | & $script:Export -Name $section -IsSummary
                     }
 
                     # Export hierarchical data directly manually (ExportData cannot handle nested objects)
@@ -675,7 +636,7 @@ function Get-ActiveDirectory {
 
                     try {
                         $userPath = Join-Path $script:OutputDirectory "$($script:filename)-$section-USER_MATRIX.csv"
-                        $privilegedUsers | Export-Csv -Path $userPath -NoTypeInformation
+                        $script:PrivilegedUsers | Export-Csv -Path $userPath -NoTypeInformation
 
                     } catch {
                         Write-Log -Message "Failed exporting: $path : $_" -Level ERROR
@@ -684,10 +645,10 @@ function Get-ActiveDirectory {
                     
                 } catch {
                     Write-Log -Message "Error in '$section': $_" -Level ERROR -Exception $_
-                    & $script:HandleError $section "Failed to gather $section"
+                    & $script:ErrorHandler $section "Failed to gather $section"
                 }
             }
-       
+
             'USERS' = {
                 Write-Console -Message "USERS" -Type info
                 
@@ -695,11 +656,9 @@ function Get-ActiveDirectory {
                     $users = Get-ADUser -Filter * -Properties $script:UserProperties -Server $script:ADDomain.PDCEmulator
 
                     if ($users) {
-                        # Export detailed user information
-                        $users | & $script:ExportData -Name $section
+                        $users | & $script:Export -Name $section # Export details
 
-                        # Calculate and export summary counts
-                        [ordered]@{
+                        [ordered]@{ # Export summary
                             'Total' = ($users | Measure-Object).Count
                             'Enabled' = ($users | Where-Object {$_.Enabled}).Count
                             'Disabled' = ($users | Where-Object {-not $_.Enabled}).Count
@@ -713,32 +672,184 @@ function Get-ActiveDirectory {
                             'PASSWD_CANT_CHANGE' = ($users | Where-Object {$_.UserAccountControl -band 0x0040}).Count
                             'DONT_REQUIRE_PREAUTH' = ($users | Where-Object {$_.UserAccountControl -band 0x400000}).Count
                             'USE_DES_KEY_ONLY' = ($users | Where-Object {$_.UserAccountControl -band 0x200000}).Count
-                        } | & $script:ExportData -Name $section -IsSummary
+                        } | & $script:Export -Name $section -IsSummary
                     } else {
                         @{
                             'Total' = 'No user objects found'
-                        } | & $script:ExportData -Name $section -IsSummary
+                        } | & $script:Export -Name $section-NONE-FOUND -IsSummary
                     }
                 } catch {
-                    & $script:HandleError $section "Failed gathering $section"
+                    & $script:ErrorHandler $section "Failed gathering $section"
+                }
+            }
+            
+            'TOMBSTONE' = {
+                Write-Console -Message "$section" -Type info
+                
+                try {
+                    $tombstone = Get-ADObject -Identity "CN=Directory Service,CN=Windows NT,CN=Services,$((Get-ADRootDSE).configurationNamingContext)" `
+                        -Properties tombstoneLifetime -Server $script:ADDomain.PDCEmulator
+                    
+                    @{
+                        'TombstoneLifetime (day)' = [int]$tombstone.tombstoneLifetime
+                    } | & $script:Export -Name $section -IsSummary
+                } catch {
+                    & $script:ErrorHandler $section "Failed gathering $section"
+                }
+            }
+    
+            'DSHEURISTICS' = {
+                Write-Console -Message "$section" -Type info
+                
+                try {
+                    $configNC = (Get-ADRootDSE).configurationNamingContext
+                    $dsService = Get-ADObject -Filter 'objectClass -eq "nTDSService"' `
+                        -SearchBase $configNC -Properties dSHeuristics -Server $script:ADDomain.PDCEmulator
+                    
+                    @{
+                        'Value' = if ($dsService.dSHeuristics) { $dsService.dSHeuristics } else { "<null>" }
+                    } | & $script:Export -Name $section -IsSummary
+                } catch {
+                    & $script:ErrorHandler $section "Failed gathering $section"
                 }
             }
 
-            'KRBTGT_ACCOUNT' = { # Kerberos ticket-granting ticket account
+            'PASSWORDPOLICY' = {
+                Write-Console -Message "$section" -Type info
+                
+                try {
+                    $policy = Get-ADDefaultDomainPasswordPolicy -Server $script:ADDomain.PDCEmulator
+                    
+                    @{
+                        'ComplexityEnabled' = $policy.ComplexityEnabled
+                        'MinPasswordLength' = $policy.MinPasswordLength
+                        'MaxPasswordAge (day)' = $policy.MaxPasswordAge.TotalDays
+                        'MinPasswordAge (day)' = $policy.MinPasswordAge.TotalDays
+                        'LockoutThreshold' = $policy.LockoutThreshold
+                        'LockoutDuration (min)' = $policy.LockoutDuration.TotalMinutes
+                        'PasswordHistoryCount' = $policy.PasswordHistoryCount
+                        'ReversibleEncryptionEnabled' = $policy.ReversibleEncryptionEnabled
+                    } | & $script:Export -Name $section -IsSummary
+                } catch {
+                    & $script:ErrorHandler $section "Failed gathering $section"
+                }
+            }
+
+            'GROUPPOLICY' = {
+                Write-Console -Message "$section" -Type info
+    
+                try {
+                    
+                    # Create subfolder
+                    try {
+                        $GpoFolder = Join-Path $script:OutputDirectory "GPO"
+                        New-Item -Path $GpoFolder -ItemType Directory -Force > $null
+                    } catch {
+                        Write-Log -Message "Failed creating GPO Folder" -Level WARN
+                    }
+                    
+                    # Get GPOs
+                    try {
+                        $Gpos = Get-GPO -All -Server $script:ADDomain.PDCEmulator
+                        Write-Log -Message "GPOs: $($Gpos.Count)" -Level INFO
+                    } catch {
+                        Write-Log -Message "Failed gahtering GPOs" -Level WARN
+                    }
+                    
+                    if ($Gpos) {
+                        foreach ($gpo in $Gpos) {
+                            # Export GPOs
+                            try {
+                                [xml]$reports = Get-GPOReport -ReportType Xml -Guid $gpo.Id -Server $script:ADDomain.PDCEmulator
+                                if ($null -ne $reports.GPO.Name) {
+                                    Get-GPOReport -Name $reports.GPO.Name -ReportType Html -Path (Join-Path $GpoFolder "$($reports.GPO.Name).html") -Server $script:ADDomain.PDCEmulator
+                                    Get-GPOReport -Name $reports.GPO.Name -ReportType Xml -Path (Join-Path $GpoFolder "$($reports.GPO.Name).xml") -Server $script:ADDomain.PDCEmulator
+                                    Write-Log -Message "Exported $($reports.GPO.Name)" -Level INFO
+                                }
+                            } catch {
+                                Write-Log -Message "Failed exporting $($gpo.DisplayName)" -Level WARN
+                            }
+                            
+                            try { # Security groups applied to
+                                $security = $gpo.GetSecurityInfo($true)  # $true includes inherited permissions
+                                $permissions = @($security | ForEach-Object {
+                                    $source = if ($_.Inherited) { 
+                                        "Inherited" 
+                                    } else { 
+                                        "Direct"
+                                    }
+                                    "$($_.Trustee) ($($_.TrusteeType)) [$source] - $($_.Permission)"
+                                } | Sort-Object)
+                            } catch {
+                                $permissions = @("Error getting permissions")
+                                Write-Log -Message "Failed gathering permissions: $($gpo.DisplayName)" -Level WARN
+                            }
+                            
+                            try { # OUs linked to
+                                $links = $gpo.GetReport().LinksTo | ForEach-Object { $_.SOMPath }
+                            } catch {
+                                $links = @("Error getting links")
+                                Write-Log -Message "Error getting linked OUs: $($gpo.DisplayName)" -Level WARN
+                            }
+
+                            # Export details
+                            try {
+                                [ordered]@{
+                                    'Name' = $gpo.DisplayName
+                                    'Owner' = $gpo.Owner
+                                    'Status' = $gpo.GpoStatus
+                                    'Linked OUs' = $links -join '; '
+                                    'Security Filtering' = $permissions -join '; '
+                                    'Description' = $gpo.Description
+                                    'CreationTime' = & $script:FormatValue $gpo.CreationTime
+                                    'ModificationTime' = & $script:FormatValue $gpo.ModificationTime
+                                    'UserVersion' = $gpo.User.DSVersion
+                                    'ComputerVersion' = $gpo.Computer.DSVersion
+                                    'WmiFilter' = if ($gpo.WmiFilter) { $gpo.WmiFilter.Name } else { "None" }
+                                    'ID' = $gpo.Id
+                                } | & $script:ExportData -Name $section
+                            } catch {
+                                Write-Log -Message "Failed exporting: $($gpo.DisplayName) $_" -Level ERROR
+                            }
+                            
+                            # Export summary
+                            [ordered]@{
+                                'Total' = $Gpos.Count
+                                'Disabled' = ($Gpos | Where-Object { $_.GpoStatus -eq 'AllSettingsDisabled' }).Count
+                                'Orphaned' = ($Gpos | Where-Object { 
+                                    try { 
+                                        -not $_.GetReport().LinksTo 
+                                    } catch { 
+                                        $true 
+                                    }
+                                }).Count
+                            } | & $script:ExportData -Name $section -IsSummary
+
+                        } 
+                    } else {
+                        [PSCustomObject]@{
+                        } | & $script:Export -Name "$section-NONE-FOUND"
+                    }
+                } catch {
+                    & $script:ErrorHandler $section "Failed gathering $section"
+                }
+            }
+
+            'KRBTGT' = {
                 Write-Console -Message "$section" -Type info
 
                 try {
                     $krbtgt = Get-ADUser 'krbtgt' -Properties PasswordLastSet -Server $script:ADDomain.PDCEmulator
                     @{
-                        'PasswordLastSet' = Format-DateTime $krbtgt.PasswordLastSet -Format Write
+                        'PasswordLastSet' = FormatValue $krbtgt.PasswordLastSet -Format Write
                         'Age (day)' = [math]::Round(((Get-Date) - (Get-ADUser 'krbtgt' -Properties PasswordLastSet -Server $script:ADDomain.PDCEmulator).PasswordLastSet).TotalDays)
-                    } | & $script:ExportData -Name $section -IsSummary
+                    } | & $script:Export -Name $section -IsSummary
                 } catch {
-                    & $script:HandleError $section "Failed to check KRBTGT account"
+                    & $script:ErrorHandler $section "Failed to check KRBTGT account"
                 }
             }
     
-            'KERBEROS_DELAGATION' = { # Kerberos delegation
+            'KERBEROS' = {
                 Write-Console -Message "$section" -Type info
                 
                 try {
@@ -772,85 +883,20 @@ function Get-ActiveDirectory {
                                 } else { 
                                     'Specific Services' 
                                 }
-                                IsSummary = $true
-                            } | & $script:ExportData -Name $section
+                            } | & $script:Export -Name $section
                         }
                     } else {
                         [PSCustomObject]@{
                             Name = "No Kerberos Delegation Found"
                             DelegationType = "N/A"
                             Scope = "N/A"
-                            IsSummary = $true
-                        } | & $script:ExportData -Name $section
+                        } | & $script:Export -Name $section-NONE-FOUND
                     }
                 } catch {
-                    & $script:HandleError $section "Failed gathering $section"
+                    & $script:ErrorHandler $section "Failed gathering $section"
                 }
             }
-
-            'PASSWORDS' = { # Group Policy stored credential
-                Write-Log -Message "Group Policy plain text passwords" -Level INFO
-                
-                try {
-                    $gpoStoragePath = "\\$($script:Domain.DNSRoot)\SYSVOL\$($script:Domain.DNSRoot)\Policies"
-                    $credentialFindings = findstr /S /I cpassword "$gpoStoragePath\*.xml"
-                    
-                    if ($credentialFindings) {
-                        Write-Log -Message "Found GPP passwords" -Level WARN
-                        
-                        $credentialFindings | ForEach-Object {
-                            [PSCustomObject]@{
-                                PolicyFile = $_
-                                Issue = "Contains encrypted password"
-                                IsSummary = $true
-                            } | & $script:ExportData -Name $section
-                        }
-                    } else {
-                        @{
-                            'Results' = "No plain text passwords found"
-                        } | & $script:ExportData -Name $section -IsSummary
-                    }
-                } catch {
-                    & $script:HandleError $section "Failed gathering $section"
-                }
-            }
-    
-            'SPOOLER' = { # Print spooler service status across domain controllers
-                Write-Log -Message "Checking print spooler status on DCs" -Level INFO
-                
-                try {
-                    $script:DCs | ForEach-Object {
-                        try {
-                            $spoolerService = Get-Service -ComputerName $_.Name -Name Spooler
-                            $startupConfig = (Get-WmiObject -Class Win32_Service -Filter "Name='Spooler'" -ComputerName $_.Name).StartMode
-                            
-                            [PSCustomObject]@{
-                                DC = $_.Name
-                                Host = $_.HostName
-                                Site = $_.Site
-                                Status = $spoolerService.Status
-                                Startup = $startupConfig
-                                Error = $null
-                                IsSummary = $true
-                            }
-                        } catch {
-                            Write-Log -Message "Failed to check spooler on $($_.Name)" -Level WARN -Exception $_
-                            [PSCustomObject]@{
-                                DC = $_.Name
-                                Host = $_.HostName
-                                Site = $_.Site
-                                Status = "Error"
-                                Startup = "Unknown"
-                                Error = $_.Exception.Message
-                                IsSummary = $true
-                            } 
-                        }
-                    } | & $script:ExportData -Name $section -Description "Print Spooler"
-                } catch {
-                    & $script:HandleError $section "Failed gathering $section"
-                }
-            }
-    
+ 
             'MSA' = {
                 Write-Log -Message "Standalone and group managed service accounts" -Level INFO
                 
@@ -879,13 +925,13 @@ function Get-ActiveDirectory {
                             [PSCustomObject]@{
                                 Name = $_.Name
                                 Type = "sMSA"
-                                'Created ' = Format-DateTime $_.Created -Format Write
-                                'Modified ' = Format-DateTime $_.Modified -Format Write
+                                'Created ' = FormatValue $_.Created -Format Write
+                                'Modified ' = FormatValue $_.Modified -Format Write
                                 HostName = $_.DNSHostName
                                 Enabled = $_.Enabled
                                 Computers = $hostComputers -join '; '
                                 Members = ($_.MemberOf | ForEach-Object { (Get-ADGroup $_).Name }) -join '; '
-                            } | & $script:ExportData -Name $section
+                            } | & $script:Export -Name $section
                         }
 
                         $gMSA | ForEach-Object {
@@ -896,19 +942,17 @@ function Get-ActiveDirectory {
                             [PSCustomObject]@{
                                 Name = $_.Name
                                 Type = "gMSA"
-                                Created = Format-DateTime $_.Created -Format Write
-                                Modified = Format-DateTime $_.Modified -Format Write
+                                Created = FormatValue $_.Created -Format Write
+                                Modified = FormatValue $_.Modified -Format Write
                                 HostName = $_.DNSHostName
                                 Enabled = $_.Enabled
                                 Principals = $principals -join '; '
                                 Members = ($_.MemberOf | ForEach-Object { (Get-ADGroup $_).Name }) -join '; '
-                            } | & $script:ExportData -Name $section
+                            } | & $script:Export -Name $section
                         }
                     } else { # No MSAs found
                         [PSCustomObject]@{
-                            Name = "No Managed Service Accounts Found"
-
-                        } | & $script:ExportData -Name "$section-None-Found"
+                        } | & $script:Export -Name "$section-NONE-FOUND"
                     }
 
                     # Generate summary statistics
@@ -916,10 +960,10 @@ function Get-ActiveDirectory {
                         'SMA' = ($sMSA | Measure-Object).Count
                         'gMSA' = ($gMSA | Measure-Object).Count
                         'Total' = ($sMSA | Measure-Object).Count + ($gMSA | Measure-Object).Count
-                    } | & $script:ExportData -Name $section -IsSummary
+                    } | & $script:Export -Name $section -IsSummary
 
                 } catch {
-                    & $script:HandleError $section "Failed gathering $section"
+                    & $script:ErrorHandler $section "Failed gathering $section"
                 }
             }
     
@@ -940,7 +984,7 @@ function Get-ActiveDirectory {
                         # Cross-reference with privileged users
                         $privilegedSPNs = $spnObjects | Where-Object {
                             $_.ObjectClass -eq 'user' -and
-                            $_.SamAccountName -in $script:PrivilegedUsers.Name
+                            $_.SamAccountName -in $script:PrivilegedUsers.SamAccountName
                         }
 
                         # Export privileged accounts with SPNs
@@ -950,32 +994,29 @@ function Get-ActiveDirectory {
                                     Name = $_.Name
                                     SamAccountName = $_.SamAccountName
                                     SPNs = $_.ServicePrincipalName -join ';'
-                                    IsSummary = $true
                                 }
-                            } | & $script:ExportData -Name "$section-PrivilegedSPNs"
+                            } | & $script:Export -Name "$section-PRIVILEGED"
                         }
                         else {
                             [PSCustomObject]@{
-                            } | & $script:ExportData -Name "$section-None-Found"
+                            } | & $script:Export -Name "$section-PRIVILEGED-NONE-FOUND"
                         }
 
-                        # Export duplicate findings if any exist
+                        # Export duplicates
                         if ($duplicateSPNs) {
                             $duplicateSPNs | ForEach-Object {
                                 [PSCustomObject]@{
                                     DuplicateSPN = $_
-                                    IsSummary = $true
                                 }
-                            } | & $script:ExportData -Name "$section-Duplicates"
+                            } | & $script:Export -Name "$section-DUPLICATE"
+                        } else {
+                            [PSCustomObject]@{
+                            } | & $script:Export -Name "$section-DUPLICATE-NONE-FOUND"
                         }
-                    }
-                    else {
+
+                    } else {
                         [PSCustomObject]@{
-                            Name = "No Service Principal Names"
-                            SamAccountName = "N/A"
-                            SPNs = "N/A"
-                            IsSummary = $true
-                        } | & $script:ExportData -Name "$section-PrivilegedSPNs"
+                        } | & $script:Export -Name "$section-NONE-FOUND"
                     }
 
                     # Generate summary
@@ -984,10 +1025,10 @@ function Get-ActiveDirectory {
                         'Objects' = ($spnObjects | Measure-Object).Count
                         'Privileged' = ($privilegedSPNs | Measure-Object).Count
                         'Duplicate' = ($duplicateSPNs | Measure-Object).Count
-                    } | & $script:ExportData -Name $section -IsSummary
+                    } | & $script:Export -Name $section -IsSummary
 
                 } catch {
-                    & $script:HandleError $section "Failed gathering $section"
+                    & $script:ErrorHandler $section "Failed gathering $section"
                 }
             }
 
@@ -995,55 +1036,60 @@ function Get-ActiveDirectory {
                 Write-Log -Message "Fine-grained password policies" -Level INFO
                 
                 try {
-                    # Query all fine-grained policies 
-                    $fineGrainedPwdPolicy = Get-ADFineGrainedPasswordPolicy -Filter * -Server $script:ADDomain.PDCEmulator
+                    # Get fine-grained policies 
+                    $fgpp = Get-ADFineGrainedPasswordPolicy -Filter * -Server $script:ADDomain.PDCEmulator
                     
-                    if ($fineGrainedPwdPolicy) {
-                        $fineGrainedPwdPolicy | ForEach-Object {
+                    if ($fgpp) {
+                        $fgpp | ForEach-Object {
                             $policy = $_
                             
-                            # Get groups this policy applies to
+                            # Get groups applied to
                             $appliesTo = Get-ADFineGrainedPasswordPolicySubject -Identity $policy
                             
-                            # Get members of each group
-                            $groupMembers = $appliesTo | ForEach-Object {
-                                Get-ADGroupMember -Identity $_ -Recursive | Select-Object Name, SamAccountName, objectClass
+                            # Get members of each group using recursive function
+                            $fgppMembers = $appliesTo | ForEach-Object {
+                                $fgppGroup = Get-ADGroup $_ -Properties Name -Server $script:ADDomain.PDCEmulator
+                                
+                                & $script:RecursiveMembers -GroupSID $fgppGroup.SID `
+                                                    -GroupName $fgppGroup.Name `
+                                                    -SecurityGroup $fgppGroup.Name `
+                                                    -AccessPaths @{}
                             }
 
-                            [PSCustomObject]@{
-                                Name = $policy.Name
-                                ComplexityEnabled = $policy.ComplexityEnabled
-                                LockoutDuration = $policy.LockoutDuration
-                                LockoutObservationWindow = $policy.LockoutObservationWindow
-                                LockoutThreshold = $policy.LockoutThreshold
-                                MaxPasswordAge = $policy.MaxPasswordAge
-                                MinPasswordAge = $policy.MinPasswordAge
-                                MinPasswordLength = $policy.MinPasswordLength
-                                PasswordHistoryCount = $policy.PasswordHistoryCount
-                                ReversibleEncryptionEnabled = $policy.ReversibleEncryptionEnabled
-                                AppliesTo = ($appliesTo | Select-Object -ExpandProperty Name) -join '; '
-                                AffectedUsers = ($groupMembers | Where-Object objectClass -eq 'user' | Select-Object -ExpandProperty Name) -join '; '
-                                AffectedGroups = ($groupMembers | Where-Object objectClass -eq 'group' | Select-Object -ExpandProperty Name) -join '; '
-                                TotalAffectedUsers = ($groupMembers | Where-Object objectClass -eq 'user' | Measure-Object).Count
-                                TotalAffectedGroups = ($groupMembers | Where-Object objectClass -eq 'group' | Measure-Object).Count
-                            } | & $script:ExportData -Name $section
+                            # Add the group membership properties to the policy object
+                            $policy | Add-Member -NotePropertyName 'AffectedUsers' -NotePropertyValue (if ($fgppMembers) { ($fgppMembers | Where-Object ObjectType -eq 'User' | Select-Object -ExpandProperty Name -Unique | Sort-Object) -join '; ' } else { 'None' })
+                            $policy | Add-Member -NotePropertyName 'AffectedGroups' -NotePropertyValue (if ($fgppMembers) { ($fgppMembers | Where-Object ObjectType -eq 'Group' | Select-Object -ExpandProperty Name -Unique | Sort-Object) -join '; ' } else { 'None' })
+                            $policy | Add-Member -NotePropertyName 'TotalAffectedUsers' -NotePropertyValue (if ($fgppMembers) { ($fgppMembers | Where-Object ObjectType -eq 'User' | Select-Object -Unique).Count } else { 0 })
+                            $policy | Add-Member -NotePropertyName 'TotalAffectedGroups' -NotePropertyValue (if ($fgppMembers) { ($fgppMembers | Where-Object ObjectType -eq 'Group' | Select-Object -Unique).Count } else { 0 })
+
+                            # Output the enhanced policy object
+                            $policy | & $script:Export -Name $section
                         }
                         
                         @{
-                            'Policies' = ($fineGrainedPwdPolicy | Measure-Object).Count
-                        } | & $script:ExportData -Name $section -IsSummary
+                            'Policies' = ($fgpp).Count
+                        } | & $script:Export -Name $section -IsSummary
                         
                     } else {
+                        # Still output empty policy for detailed report
+                        [PSCustomObject]@{
+                            'Name' = 'No Fine-Grained Password Policies Found'
+                            'AffectedUsers' = 'None'
+                            'AffectedGroups' = 'None'
+                            'TotalAffectedUsers' = 0
+                            'TotalAffectedGroups' = 0
+                        } | & $script:Export -Name $section
+
                         @{
                             'PolicyCount' = 0
-                        } | & $script:ExportData -Name $section -IsSummary
+                        } | & $script:Export -Name $section -IsSummary
                     }
                 } catch {
-                    & $script:HandleError $section "Failed gathering $section"
+                    & $script:ErrorHandler $section "Failed gathering $section"
                 }
             }
 
-            'SYSVOL' = { # SYSVOL share permissions
+            'SYSVOL' = {
                 Write-Console -Message "SYSVOL"
                 
                 try {
@@ -1083,80 +1129,27 @@ function Get-ActiveDirectory {
                     
                     if ($results) {
                         # Detailed export
-                        $results | & $script:ExportData -Name $section
+                        $results | & $script:Export -Name $section
                         
                         # Summary export
                         @{
                             'DCsProcessed' = ($script:DCs | Measure-Object).Count
                             'CustomPermissions' = ($results | Measure-Object).Count
                             'Status' = 'Custom permissions found'
-                        } | & $script:ExportData -Name $section -IsSummary
+                        } | & $script:Export -Name $section -IsSummary
                     } else { # Mo custom permissions found
                         @{
                             'DCsProcessed' = ($script:DCs | Measure-Object).Count
                             'CustomPermissions' = 0
                             'Status' = 'No custom permissions found'
-                        } | & $script:ExportData -Name $section -IsSummary
+                        } | & $script:Export -Name $section -IsSummary
                     }
                 } catch {
-                    & $script:HandleError $section "Failed gathering $section"
+                    & $script:ErrorHandler $section "Failed gathering $section"
                 }
             }
 
-            'COMPUTERS' = { # Active Directory computer accounts
-                Write-Console -Message "COMPUTERS" -Type info
-                
-                try {
-                    # Query all computer objects
-                    $computers = Get-ADComputer -Filter * -Properties @(
-                        'Name', 'DistinguishedName', 'OperatingSystem', 
-                        'OperatingSystemVersion', 'LastLogonDate', 'Enabled',
-                        'TrustedForDelegation', 'whenCreated'
-                    ) -Server $script:ADDomain.PDCEmulator
-
-                    if ($computers) {
-                        # Process and format computer information
-                        $computerInfo = $computers | Select-Object `
-                            Name,
-                            DistinguishedName,
-                            @{ Name = 'OS'; Expression = {$_.OperatingSystem} },
-                            @{ Name = 'OSVersion'; Expression = {$_.OperatingSystemVersion} },
-                            @{ Name = 'LastLogonDate'; Expression = {Format-DateTime $_.LastLogonDate -Format Write} },
-                            @{ Name = 'Status'; Expression = {if ($_.Enabled) {'Enabled'} else {'Disabled'}} },
-                            TrustedForDelegation,
-                            @{ Name = 'Created'; Expression = {Format-DateTime $_.whenCreated -Format Write} }
-
-                        # Export detailed computer information
-                        $computerInfo | & $script:ExportData -Name $section
-
-                        # Calculate summary metrics
-                        $total = ($computers | Measure-Object).Count
-                        $disabled = ($computers | Where-Object {-not $_.Enabled} | Measure-Object).Count
-                        $delegated = ($computers | Where-Object {$_.TrustedForDelegation} | Measure-Object).Count
-                        $stale = ($computers | Where-Object {
-                            $_.LastLogonDate -and 
-                            $_.LastLogonDate -lt (Get-Date).AddDays(-90)
-                        } | Measure-Object).Count
-
-                        # Export summary information
-                        @{
-                            'Total' = $total
-                            'Disabled' = $disabled
-                            'Delegated' = $delegated
-                            'Stale' = $stale
-                        } | & $script:ExportData -Name $section -IsSummary
-                    } else {
-                        # Record when no computer objects are found
-                        @{
-                            'Total' = 'No computer objects found'
-                        } | & $script:ExportData -Name $section -IsSummary
-                    }
-                } catch {
-                    & $script:HandleError $section "Failed gathering $section"
-                }
-            }
-
-            'LOGGING' = { # Security audit policy settings
+            'LOGGING' = {
                 Write-Console -Message "LOGGING"
             
                 try {
@@ -1231,17 +1224,106 @@ function Get-ActiveDirectory {
                     }
 
                     # Detailed export
-                    $results | & $script:ExportData -Name $section
+                    $results | & $script:Export -Name $section
                     
                     # Summary export
                     @{
                         'Total' = ($results | Measure-Object).Count
                         'Success' = ($results | Where-Object Success | Measure-Object).Count
                         'Failure' = ($results | Where-Object Failure | Measure-Object).Count
-                    } | & $script:ExportData -Name $section -IsSummary
+                    } | & $script:Export -Name $section -IsSummary
                     
                 } catch {
-                    & $script:HandleError $section "Failed gathering $section"
+                    & $script:ErrorHandler $section "Failed gathering $section"
+                }
+            }
+
+            'COMPUTERS' = {
+                Write-Console -Message "COMPUTERS" -Type info
+                
+                try {
+                    # Query all computer objects
+                    $computers = Get-ADComputer -Filter * -Properties @(
+                        'Name', 'DistinguishedName', 'OperatingSystem', 
+                        'OperatingSystemVersion', 'LastLogonDate', 'Enabled',
+                        'TrustedForDelegation', 'whenCreated'
+                    ) -Server $script:ADDomain.PDCEmulator
+
+                    if ($computers) {
+                        # Process and format computer information
+                        $computerInfo = $computers | Select-Object `
+                            Name,
+                            DistinguishedName,
+                            @{ Name = 'OS'; Expression = {$_.OperatingSystem} },
+                            @{ Name = 'OSVersion'; Expression = {$_.OperatingSystemVersion} },
+                            @{ Name = 'LastLogonDate'; Expression = {FormatValue $_.LastLogonDate -Format Write} },
+                            @{ Name = 'Status'; Expression = {if ($_.Enabled) {'Enabled'} else {'Disabled'}} },
+                            TrustedForDelegation,
+                            @{ Name = 'Created'; Expression = {FormatValue $_.whenCreated -Format Write} }
+
+                        # Export detailed computer information
+                        $computerInfo | & $script:Export -Name $section
+
+                        # Calculate summary metrics
+                        $total = ($computers | Measure-Object).Count
+                        $disabled = ($computers | Where-Object {-not $_.Enabled} | Measure-Object).Count
+                        $delegated = ($computers | Where-Object {$_.TrustedForDelegation} | Measure-Object).Count
+                        $stale = ($computers | Where-Object {
+                            $_.LastLogonDate -and 
+                            $_.LastLogonDate -lt (Get-Date).AddDays(-90)
+                        } | Measure-Object).Count
+
+                        # Export summary information
+                        @{
+                            'Total' = $total
+                            'Disabled' = $disabled
+                            'Delegated' = $delegated
+                            'Stale' = $stale
+                        } | & $script:Export -Name $section -IsSummary
+                    } else {
+                        # Record when no computer objects are found
+                        @{
+                            'Total' = 'No computer objects found'
+                        } | & $script:Export -Name $section -IsSummary
+                    }
+                } catch {
+                    & $script:ErrorHandler $section "Failed gathering $section"
+                }
+            }
+
+            'SPOOLER' = { # Print spooler service status across domain controllers
+                Write-Log -Message "Checking print spooler status on DCs" -Level INFO
+                
+                try {
+                    $script:DCs | ForEach-Object {
+                        try {
+                            $spoolerService = Get-Service -ComputerName $_.Name -Name Spooler
+                            $startupConfig = (Get-WmiObject -Class Win32_Service -Filter "Name='Spooler'" -ComputerName $_.Name).StartMode
+                            
+                            [PSCustomObject]@{
+                                DC = $_.Name
+                                Host = $_.HostName
+                                Site = $_.Site
+                                Status = $spoolerService.Status
+                                Startup = $startupConfig
+                                Error = $null
+                                IsSummary = $true
+                            }
+                        } catch {
+                            Write-Log -Message "Failed to check spooler on $($_.Name)" -Level WARN -Exception $_
+                            [PSCustomObject]@{
+                                DC = $_.Name
+                                Host = $_.HostName
+                                Site = $_.Site
+                                Status = "Error"
+                                Startup = "Unknown"
+                                Error = $_.Exception.Message
+                                IsSummary = $true
+                            } 
+                        }
+                    } | & $script:Export -Name $section -Description "Print Spooler"
+                } catch {
+                    & $script:ErrorHandler $section "Failed gathering $section"
                 }
             }
         }
@@ -1261,87 +1343,17 @@ function Get-ActiveDirectory {
             } catch {
                 Write-Log -Message "Error processing section: $section" -Level ERROR -Exception $_
                 @{ 'Status' = "Error: Processing failed" } | 
-                    & $script:ExportData -Name $section -IsSummary
+                    & $script:Export -Name $section -IsSummary
             }
         }
 
         Write-Log -Message "AD General assessment completed" -Level INFO
-        Write-Console -Message "FINISHED GATHERING ACTIVE DIRECTORY INFORMATION" -Type done
+        Write-Console -Message "DONE" -Type done
 
     } catch {
         Write-Log -Message "Critical error in AD Information gathering" -Level ERROR -Exception $_
         Write-Console -Message "Error gathering AD Information" -Type warn
     }
-}
-
-function Get-GroupPolicies {
-    Write-Console -Message "GATHERING GROUP POLICIES" -Type header
-    
-    $results = @()
-    $GpoFolder = Join-Path $script:OutputDirectory "$script:Name-GPO"
-    
-    # Folder management for HTML/XML reports
-    try {
-        New-Item -Path $GpoFolder -ItemType Directory -Force > $null
-    } catch {
-        Write-Log -Message "Unable to create GPO Folder" -Level WARN
-    }
-    
-    # Get all GPOs
-    Write-Log -Message "Retrieving GPO list" -Level INFO
-    $Gpos = Get-GPO -All
-    
-    if (-not $Gpos) {
-        Write-Console -Message "No Group Policies found" -Type warn
-        return
-    }
-    
-    # Add CSV headers
-    $results += "GROUP POLICIES,"
-    
-    foreach ($gpo in $Gpos) {
-        # Add GPO info to CSV
-        $results += "$($gpo.DisplayName),$($gpo.Id)"
-        $results += "Created,$(Format-DateTime $gpo.CreationTime -Format Write)"
-        $results += "Modified,$(Format-DateTime $gpo.ModificationTime -Format Write)"
-        
-        # Get security info gracefully
-        try {
-            $links = ($gpo.GetSecurityInfo()).TrusteePermissions.Count
-        } catch {
-            $links = "Error getting permissions"
-            Write-Log -Message "Error getting permissions for $($gpo.DisplayName)" -Level WARN
-        }
-        $results += "Links,$links"
-        
-        # Get WMI filter gracefully
-        $wmiFilter = if ($gpo.WmiFilter) { $gpo.WmiFilter.Name } else { "None" }
-        $results += "WMI Filter,$wmiFilter"
-        $results += "Status,$($gpo.GpoStatus)"
-        $results += ","  # Separator between GPOs
-        
-        # Export HTML/XML reports
-        try {
-            [xml]$reports = Get-GPOReport -ReportType Xml -Guid $gpo.Id
-            if ($null -ne $reports.GPO.Name) {
-                $html = Join-Path $GpoFolder "$($reports.GPO.Name).html"
-                $xml = Join-Path $GpoFolder "$($reports.GPO.Name).xml"
-                
-                Get-GPOReport -Name $reports.GPO.Name -ReportType Html -Path $html
-                Get-GPOReport -Name $reports.GPO.Name -ReportType Xml -Path $xml
-                
-                Write-Console -Message "$($reports.GPO.Name)"
-            }
-        } catch {
-            Write-Console -Message "Failed to export: $($gpo.DisplayName)" -Type warn
-            continue
-        }
-    }
-    
-    # Export CSV results
-    $outputPath = Join-Path $script:OutputDirectory "$($script:filename)-GPO.csv"
-    $results | Out-File -FilePath $outputPath -Force
-	Write-Console -Message "FINISHED GATHERING GROUP POLICIES" -Type done
 }
 
 function Get-NetworkSettings {
@@ -1420,7 +1432,7 @@ function Get-NetworkSettings {
         $results | Out-File -FilePath $outputPath -Force
         
         Write-Log -Message "Network settings exported to: $outputPath" -Level INFO
-        Write-Console -Message "FINISHED GATHERING NETWORK SETTINGS" -Type done
+        Write-Console -Message "DONE" -Type done
         return # explicite return to stop execution
     } catch {
         Write-Log -Message "Error in network settings audit" -Level ERROR -Exception $_
@@ -1438,36 +1450,36 @@ function Get-CertificateServices {
     try {
         $caCheck = certutil -ping
         if ($LASTEXITCODE -ne 0) {
-            Write-Console -Message "No Certificate Services found - skipping" -Type done
+            Write-Console -Message "None found" -Type done
             
             @{
-                'CAs_Found' = 0
-                'Status' = 'No Certificate Services found'
-            } | & $script:ExportData -Name "CertificateServices" -IsSummary
-            
+                'CAs' = 0
+                'Status' = 'None found'
+            } | & $script:Export -Name "ADCS" -IsSummary
+
             return
         }
 
         # Check PSPKI module
         $pspkiStatus = Test-ModuleAvailability -ModuleName $script:CertModule
         if ($pspkiStatus -ne "Ready") {
-            Write-Console -Message "PSPKI module not available - skipping Certificate Services assessment" -Type warn
+            Write-Console -Message "PSPKI module not available" -Type warn
             
             @{
-                'CAs_Found' = 0
+                'CAs' = 0
                 'Status' = 'PSPKI module not available'
-            } | & $script:ExportData -Name "CertificateServices" -IsSummary
+            } | & $script:Export -Name "ADCS" -IsSummary
             
             return
         }
     } catch {
-        Write-Log -Message "Error checking Certificate Services: $($_.Exception.Message)" -Level WARN
+        Write-Log -Message "Error checking Certificate Services: $_" -Level WARN
         Write-Console -Message "Error checking Certificate Services" -Type warn
         
         @{
             'CAs_Found' = 0
             'Status' = 'Error checking Certificate Services'
-        } | & $script:ExportData -Name "CertificateServices" -IsSummary
+        } | & $script:Export -Name "CertificateServices" -IsSummary
         
         return
     }
@@ -1491,7 +1503,7 @@ function Get-CertificateServices {
             @{
                 'CAs_Found' = 0
                 'Status' = 'No CAs found in domain'
-            } | & $script:ExportData -Name "CertificateServices" -IsSummary
+            } | & $script:Export -Name "CertificateServices" -IsSummary
             
             return
         }
@@ -1641,13 +1653,9 @@ function Get-CertificateServices {
                     [PSCustomObject]@{
                         TemplateName = $_.TemplateCommonName
                         Finding = $vulnerabilities -join '; '
-                        RiskLevel = 'High'
-                        Impact = 'Potential certificate misuse'
-                        Remediation = 'Review and restrict template permissions'
-                        IsSummary = $true
                     }
                 }
-            } | & $script:ExportData -Name "CertificateServices-Vulnerabilities"
+            } | & $script:Export -Name "CertificateServices-Vulnerabilities"
 
             # Audit logging compliance
             $auditAnalysis = $auditResults | ForEach-Object {
@@ -1673,19 +1681,19 @@ function Get-CertificateServices {
                         IsSummary = $true
                     }
                 }
-            } | & $script:ExportData -Name "CertificateServices-AuditFindings"
+            } | & $script:Export -Name "ADCS-AuditFindings"
 
             # Generate summary
             @{
-                'CAs_Found' = $cas.Count
-                'Total_Templates' = $filter.Count
-                'Templates_With_Weak_Security' = ($templateAnalysis | Measure-Object).Count
-                'CAs_With_Audit_Issues' = ($auditAnalysis | Measure-Object).Count
-                'NTAuth_Certificates' = ($ntAuthCerts | Measure-Object).Count
+                'CAs' = $cas.Count
+                'Templates' = $filter.Count
+                'Templates_With_Weak_Security' = ($templateAnalysis).Count
+                'CAs_With_Audit_Issues' = ($auditAnalysis).Count
+                'NTAuth_Certificates' = ($ntAuthCerts).Count
                 'Status' = 'Assessment completed'
-            } | & $script:ExportData -Name "CertificateServices" -IsSummary
+            } | & $script:Export -Name "ADCS" -IsSummary
 
-            Write-Console -Message "FINISHED GATHERING CERTIFICATE SERVICES" -Type done
+            Write-Console -Message "DONE" -Type done
 
         } catch {
             Write-Log -Message "Failed to process audit configuration" -Level ERROR -Exception $_
@@ -1693,7 +1701,7 @@ function Get-CertificateServices {
 
     } catch {
         Write-Log -Message "Certificate Services assessment failed" -Level ERROR -Exception $_
-        & $script:HandleError "CertificateServices" "Assessment failed: $($_.Exception.Message)"
+        & $script:ErrorHandler "ADCS" "Assessment failed: $_"
     }
 }
 
@@ -1702,7 +1710,7 @@ function Initialize-BRAVE {
     param( 
    )
     
-    # 1. Cleanup from previous run
+    # 1. Cleanup previous run
     try {
         if (Test-Path $script:OutputDirectory) {
             Write-Log -Message "Removing output directory: $script:OutputDirectory"
@@ -1711,36 +1719,36 @@ function Initialize-BRAVE {
         New-Item -Path $script:OutputDirectory -ItemType Directory -Force | Out-Null
     } catch {
         Write-Log -Message "Cleanup failed: $_" -Level ERROR
-        throw  # Re-throw to #Script Execution block
+        throw  # Re-throw to Script Execution block
     }
 
-    # 2. Clear only script-scoped variables
+    # 2. Clear script-scoped variables
     Get-Variable script:* | Remove-Variable -Force
 
     # 3. Declare core
-    $script:Version = "2.0.0"
+    $script:Version = $Version
     $script:StartTime = [System.DateTime]::UtcNow
     $script:RequiredModules = $ModuleList
     $script:OutputDirectory = $OutputDirectory  # Set by ValidateScript param
-
-    # 4. Declare domain (required for filenames)
-    try {
+    $script:Version = $Version # Set by ValidateScript param
+    try { # Filename
         $script:ADDomain = Get-ADDomain
         $script:filename = $script:ADDomain.DNSRoot
+        Write-Log -Message "Domain found, filenames are: $($script:filename)" -Level INFO
     } catch {
         $script:filename = $env:COMPUTERNAME
-        Write-Log -Message "AD Domain not found, using computer name: $($script:filename)" -Level INFO
+        Write-Log -Message " Domain not found, filenames are: $($script:filename)" -Level INFO
     }
 
     # 5. Declare paths and names (log, archive)
-    $script:LogFile = Join-Path $script:OutputDirectory "$($script:filename).log"
+    $script:Log = Join-Path $script:OutputDirectory "$($script:filename).log"
     $script:Archive = Join-Path (Split-Path $script:OutputDirectory) "$($script:filename).zip"
 
     # 6. Create and initialize log file
     try {
-        New-Item -Path $script:LogFile -ItemType File -Force | Out-Null
-        "[$(Format-DateTime -Format Write)] === BRAVE Assessment Started ===" | 
-            Out-File -FilePath $script:LogFile -Encoding UTF8
+        New-Item -Path $script:Log -ItemType File -Force | Out-Null
+        "[$(FormatValue -Format Write)] === BRAVE Assessment Started ===" | 
+            Out-File -FilePath $script:Log -Encoding UTF8
     } catch {
         Write-Warning "Failed to create log file: $_"
         throw
@@ -1965,7 +1973,7 @@ function Initialize-BRAVE {
         throw $errorMessage # Throw error to stop script
     }
     Write-Console -Message "POWERSHELL: READY"
-    Write-Console -Message "FINISHED CHECKING PREREQUISITES" -Type done
+    Write-Console -Message "DONE" -Type done
     return $true # All prerequisites met
 }
 
@@ -1978,20 +1986,24 @@ function Start-BRAVE {
     try {
         # 1. Broadcast status
         $summary = @"
-SCRIPT:     v$script:Version
-STARTED:    $(Format-DateTime $script:StartTime -Format Write)
-DIRECTORY:  $script:OutputDirectory
-OS:         $((Get-CimInstance -ClassName Win32_OperatingSystem).Caption)
+SCRIPT: v$script:Version
+START:  $(FormatValue $script:StartTime -Format Write)
+FILE:   $($script:Archive)
 "@
 
         $details = @"
-PSCommandPath:  ($PSCommandPath)
-FOREST:         $($script:ADForest.Name)
-DOMAIN:         $($script:ADDomain.DNSRoot)
-LOG FILE:       $($script:LogFile)
-ARCHIVE FILE:   $($script:Archive)
-PDC:            $($script:ADDomain.PDCEmulator)
-DCs:            $($script:DCs)
+HOST:   $env:COMPUTERNAME
+OS:     $((Get-CimInstance -ClassName Win32_OperatingSystem).Caption)
+USER:   $([Security.Principal.WindowsIdentity]::GetCurrent().Name)
+OUTPUT: $script:OutputDirectory
+LOG:    $($script:Log)
+PS APP: $Host.Name
+PS PTH: $PSCommandPath
+PS CMD: $MyInvocation.MyCommand.Name
+FOREST: $($script:ADForest.Name)
+DOMAIN: $($script:ADDomain.DNSRoot)
+PDC:    $($script:ADDomain.PDCEmulator)
+DCs:    $($script:DCs)
 "@
         Write-Console -Message "`n$summary"
         Write-Log -Message $details -Level INFO
@@ -2026,29 +2038,53 @@ DCs:            $($script:DCs)
                 Write-Log -Message "Command execution failed: $($command.ToString())" -Level ERROR -Exception $_
             }
         } 
+        Write-Console -Message "`n"
+        Write-Console -Message "CREATING ARCHIVE FILE" -ForegroundColor White
 
-        Write-Console -Message "`nCREATING ARCHIVE FILE: $script:Archive"
+       # 4. Archive results
+        $GpoFolder = Join-Path $script:OutputDirectory "GPO"
 
-        # 4. Archive results
-        $itemsToArchive = Get-ChildItem -Path $script:OutputDirectory -Recurse -File
+        # Get items to archive, excluding the GPO folder
+        $itemsToArchive = Get-ChildItem -Path $script:OutputDirectory -File
+        $itemsToArchive += Get-ChildItem -Path $script:OutputDirectory -Directory | 
+            Where-Object { $_.FullName -ne $GpoFolder }
+
         Write-Log -Message "Archive File Count: $($itemsToArchive.Count)" -Level INFO
         Write-Log -Message "Archiving: $($itemsToArchive.Name -join ', ')" -Level INFO
 
         try {
-            # Add files
-            if ($itemsToArchive) {
-                $nonLogFiles = $itemsToArchive | Where-Object { $_.FullName -ne $script:LogFile }
-                Compress-Archive -Path $nonLogFiles.FullName -DestinationPath $script:Archive -Force
-                Write-Log -Message "Added output directory contents to archive" -Level INFO
-                Start-Sleep -Seconds 1
+            if ($itemsToArchive) { # Add files
+                try {
+                    $nonLogFiles = $itemsToArchive | Where-Object { $_.FullName -ne $script:Log }
+                    Compress-Archive -Path $nonLogFiles.FullName -DestinationPath $script:Archive -Force
+                    Write-Log -Message "Added output directory contents to archive" -Level INFO
+                    Start-Sleep -Seconds 1
+                } catch {
+                    Write-Log -Message "Failed to add files to archive: $_" -Level ERROR
+                }
             }
 
-            # Add PS script
-            if ($PSCommandPath) {
-                Compress-Archive -Path $PSCommandPath -DestinationPath $script:Archive -Update
-                Write-Log -Message "Added script $PSCommandPath to archive" -Level INFO
-                Start-Sleep -Seconds 1
+            if (Test-Path $GpoFolder) { # Add GPO folder
+                try {
+                    Compress-Archive -Path $GpoFolder -DestinationPath $script:Archive -Update
+                    Write-Log -Message "Added GPO folder to archive" -Level INFO
+                    Start-Sleep -Seconds 1
+                } catch {
+                    Write-Log -Message "Failed to add GPO folder to archive: $_" -Level ERROR
+                }
             }
+
+            if ($PSCommandPath) { # Add invoked script
+                try {
+                    Compress-Archive -Path $PSCommandPath -DestinationPath $script:Archive -Update
+                    Write-Log -Message "Added script $PSCommandPath to archive" -Level INFO
+                    Start-Sleep -Seconds 1
+                } catch {
+                    Write-Log -Message "Failed to add script to archive: $_" -Level ERROR
+                }
+            }
+
+            Write-Console -Message 'DONE' -Type done
 
             # Write summary
             $duration = [datetime]::UtcNow - $script:StartTime
@@ -2059,36 +2095,36 @@ DCs:            $($script:DCs)
             }
 
             $summary = @"
-CREATED:    $script:Archive
-STARTED:    $(Format-DateTime $script:StartTime -Format Write)
-FINISHED:   $(Format-DateTime ([datetime]::UtcNow) -Format Write)
+STARTED:    $(FormatValue $script:StartTime -Format Write)
+FINISHED:   $(FormatValue ([datetime]::UtcNow) -Format Write)
 DURATION:   $durationFormatted
+CREATED:    $script:Archive
 "@ 
             Write-Log -Message "`n$summary" -Level INFO
             Write-Log -Message "=== BRAVE Assessment Complete ===" -Level INFO
-            Start-Sleep -Seconds 2
+            Start-Sleep -Milliseconds 500
 
             # Add log file
-            Compress-Archive -Path $script:LogFile -DestinationPath $script:Archive -Update
-            Write-Log -Message "Added log file to archive" -Level INFO
-            Start-Sleep -Seconds 1
+            Compress-Archive -Path $script:Log -DestinationPath $script:Archive -Update
+            Write-Log -Message "Added $($script:Log) to $($script:Archive)" -Level INFO
+            Start-Sleep -Milliseconds 500
 
             # Verify archive and cleanup
             if (Test-Path $script:Archive) {
-                if (Test-Archive -Path $script:Archive) {
+                if (& $script:Validate -Path $script:Archive) {
                     try { # Cleanup
-                        Get-ChildItem -Path $script:OutputDirectory -Exclude (Split-Path $script:LogFile -Leaf) |
+                        Get-ChildItem -Path $script:OutputDirectory -Exclude (Split-Path $script:Log -Leaf) |
                             Remove-Item -Recurse -Force -Confirm:$false
-                        Remove-Item -Path $script:LogFile -Force
+                        Remove-Item -Path $script:Log -Force
                         Remove-Item -Path $script:OutputDirectory -Force
                     }
                     catch {
-                        Write-Log -Message "Failed to clean up: $_" -Level ERROR
+                        Write-Log -Message "Failed post clean up: $_" -Level ERROR
                     }
                 }
                 else {
-                    Write-Log -Message "Archive verification failed - skipping cleanup" -Level WARN
-                    Write-Console -Message "Archive verification failed" -Type warn
+                    Write-Log -Message "Archive validation failed - skipping cleanup" -Level WARN
+                    Write-Console -Message "Archive failed" -Type warn
                 }
             }
             else {
@@ -2097,7 +2133,7 @@ DURATION:   $durationFormatted
             }
         }
         catch {
-            Write-Warning "Critical error during archive creation: $_"
+            Write-Warning "Error creating archive: $_"
             throw
         }
     }
@@ -2113,21 +2149,20 @@ DURATION:   $durationFormatted
 
 # Script Execution
 try {
-    # Run Initialize-BRAVE
-    $initResult = Initialize-BRAVE
     
-    # Check return from Initialize-BRAVE
-    if ($null -eq $initResult -or $initResult -eq $false) {
-        Write-Log -Message "Initalize failed" -Level ERROR
+    $initResult = Initialize-BRAVE # Run Initialize-BRAVE
+    
+    if ($null -eq $initResult -or $initResult -eq $false) { # Check return from Initialize-BRAVE
+        Write-Log -Message "Initalize failed $_" -Level ERROR
         Write-Console -Message "Error initalizing BRAVE script" -Type err
         exit 1 # Exit script
+    } else {
+        Write-Log -Message "Initalize succcess, continuing with execution" -Level INFO
+        Start-BRAVE 
     }
-    
-    # Continue with main execution
-    Start-BRAVE
 } 
 catch {
-    Write-Log -Message "Main execution failed" -Level ERROR -Exception $_
+    Write-Log -Message "Script Execution failed" -Level ERROR -Exception $_
     Write-Console -Message "Error executing BRAVE script" -Type err
     exit 1
 }
