@@ -26,7 +26,7 @@ param(
         }
         return $true
     })]
-    [string]$Version = "2.2.0",
+    [string]$Version = "2.3",
     [string[]]$RequiredModules = @('GroupPolicy'),
     [string]$CertModule = "PSPKI",
     [string]$Directory = "c:\temp\BRAVE\",
@@ -36,7 +36,7 @@ param(
 $ErrorActionPreference = "SilentlyContinue" # Fail-forward
 
 
-#region Handlers
+#region HANDLERS
 function FormatValue {
     param(
         [Parameter(ValueFromPipeline)]
@@ -255,9 +255,9 @@ $script:Validate = {
         if ($zip) { $zip.Dispose() }
     }
 }
-#endregion Handlers
+#endregion HANDLERS
 
-#region Write
+#region ## WRITE ##
 
 function Write-Info {
     [CmdletBinding()]
@@ -274,28 +274,32 @@ function Write-Info {
     <#
     .EXAMPLE
    
-    Write-Info -m "This is a basic log entry."                              # Basic log entry
+    Write-Info -m "Hello world"                                                             # Example: Basic log entry
     
-    Write-Info -m "<techincal output>" -show "Process complete"             # Log entry and user displayed text
+    Write-Info -m "Executing Get-ADDomain query" -show "Querying Domain"                    # Example: Log entry and include different'simple' console output for user
     
-    try {                                                                   ---- example code ----
-        Get-ADDomain                                                        
+    ---- start example code ----                                                            # Example: Used within script
+
+    try {                                                                                  
+        Get-ADDomain                                                                                      
             try {
                 Get-ADDomain -SpecicDetails
             } catch {
-                throw 
-            }
+                Write-Info -m "Get-ADDomain -SpecicDetails" -lvl Warn -ex $_                # Example: Log granular message { -m "Get-ADDomain -SpecicDetails failed" } and include exception details { -ex $_ } for log output 
+            } 
     } catch {                                                              
-        Write-Info -m "" -lvl Error -ex $_                                  # Show thrown error with exception details
-        Write-Info -m "ADDomain failed" -lvl Error -ex $_                   # Include addtional text
-    }                                                                       ---- example code ----
+        Write-Info -m "Get-ADDomain failed" -lvl Warn -ex $_ -show "Domain Query Failed"    # Example: Log granular message { -m "Get-ADDomain failed }, include exception details { -ex $_ } for log output, and include simple user message
+    }                                                                                           
+    
+    ---- end example code ----                                                                        
+    
     #>
 
-    $ts = Get-Date -Format 'MMM dd yyyy HH:mm:ss'                           # Timestamp
-    $msg = "[$ts] [$lvl] $m"                                                # Base message {[timestamp] [loglevel] message}
+    $ts = Get-Date -Format 'MMM dd yyyy HH:mm:ss'                           # Generate timestamp
+    $msg = "[$ts] [$lvl] $m"                                                # Create base message (timestamp, logging level {-lvl Warn}, message {-m "Get-ADDomain..."})
 
     
-    if (($lvl -eq 'Warn' -or $lvl -eq 'Error') -and $ex) {                  # {-ex $_ } Exception handling for 
+    if (($lvl -eq 'Warn' -or $lvl -eq 'Error') -and $ex) {                  # Exception handling for -lvl Warn and Error, if included { -ex $_  } 
         $exceptionDetails = @(
             "   EXCEPTION:",
             "   Type:", 
@@ -311,29 +315,29 @@ function Write-Info {
         )
         $msg += "`n" + ($exceptionDetails -join "`n")
     }
-                                                                            # Check log availability
-    $ready = $script:Log -and (Test-Path $script:Log)
+                                                                            
+    $ready = $script:Log -and (Test-Path $script:Log)                       # Check log availability
     if (-not $NoLog -and $ready) {                                          # {-NoLog} parmater was not used and log is available 
-        try {                                                               # Attempt append to log
+        try {        
             $msg | Out-File -FilePath $script:Log -Append -Force -Encoding UTF8
-        } catch {                                                           # Output to console if append fails
+        } catch {                                                           # Output console if append fails
             Write-Warning "[!] Write-Info failed: $msg"
         }
-    } else {                                                                # Emergency output for warnings and errors, if log is unavailable
+    } else {                                                                # Output for -lvl Warn/Error even if log is unavailable
         if ($lvl -eq 'Warn') { Write-Warning $m }
         elseif ($lvl -eq 'Error') { Write-Error $m }
     }
 
-    if ($show) {                                                            # {-show " "} User-friendly message 
+    if ($show) {                                                            # User-facing formatting for varoius -lvl {"Get-ADDomain -SpecicDetails" -lvl Warn} 
         switch ($lvl) {
             'Info'   { Write-Host $show -ForegroundColor Cyan }
             'Done'   { Write-Host $show -ForegroundColor Green }
-            'Debug'  { Write-Host $show -ForegroundColor Cyan }
+            'Debug'  { Write-Host $show -ForegroundColor White }
             'Warn'   { Write-Host "[*] $show" -ForegroundColor Yellow }
             'Error'  { Write-Host "[!] $show" -ForegroundColor Red }
             'Header' {
                 Write-Host "`n=================================" -ForegroundColor DarkGray
-                Write-Host $show -ForegroundColor DarkGray
+                Write-Host $show -ForegroundColor White
                 Write-Host "=================================" -ForegroundColor DarkGray
             }
             'Status' {
@@ -433,9 +437,9 @@ function Write-Console {
         }
     }
 }
-#endregion Write
+#endregion ## WRITE ##
 
-#region Requirements
+#region ## REQIUREMENTS ##
 # Check PowerShell version
 if ($PSVersionTable.PSVersion.Major -lt 5) {
     Write-Info "PowerShell 5 or higher required. Current version: $($PSVersionTable.PSVersion)"
@@ -447,13 +451,14 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     Write-Info "Script requires elevation. Run PowerShell with 'Run As Administrator'."
     throw
 }
-#endregion Requirements
+#endregion ## REQIUREMENTS ##
 
+#region ## GET ##
 function Get-ActiveDirectory {
     [CmdletBinding()]
     param()
     
-    Write-Info -m "Starting Get-AtciveDirectory" -lvl header -show "QUERYING ACTIVE DIRECTORY" 
+    Write-Info -m "Starting Get-AtciveDirectory" -lvl Header -show "QUERYING ACTIVE DIRECTORY" 
 
     try {
         $controls = [ordered]@{
@@ -1871,12 +1876,13 @@ function Get-CertificateServices {
         Write-Log -Message "Certificate Services failed: $_" -Level ERROR
     }
 }
+#endregion ## GET ##
 
 function Initialize-BRAVE {
     [CmdletBinding()]
     param(
     )
-    # 1
+    # 1. Declare core
     Write-Info -m "Delcare core variables"
     Get-Variable script:* | Remove-Variable -Force  # Clear previous run
     $script:StartTime = [System.DateTime]::UtcNow   # Get current time
@@ -1884,6 +1890,7 @@ function Initialize-BRAVE {
     $script:CertModule = $CertModule                                                        #   from global
     $script:Version = $Version                                                              #   script param
     $script:Directory = $Directory                                                          # }
+    $script:filename = $env:COMPUTERNAME                                                    # Start with computer name
     try {                                                                                   # Filename suffix
         $script:ADDomain = Get-ADDomain
         $script:filename = $script:ADDomain.DNSRoot                                         # Get-ADDomain succeeded
@@ -1893,16 +1900,16 @@ function Initialize-BRAVE {
     $script:Log = Join-Path $script:Directory "$($script:filename).log"                     # Establish log file
     $script:Archive = Join-Path (Split-Path $script:Directory) "$($script:filename).zip"    # Establish archive file
     
-    # 2
-    Write-Info -m "Initalize log file"
+    # 2. Initalize log file
+
     try {
         if (-not (Test-Path $script:Directory)) {
             Write-Info -m "$($script:Directory) doesn't exist, creating" -lvl Debug
             New-Item -Path $script:Directory -ItemType Directory -Force | Out-Null
         }
         
-        "[$(FormatValue -Format Write)] === BRAVE Assessment Started ===" | # Log header
-            Set-Content -Path $script:Log -Force -Encoding UTF8
+        "=== BRAVE Assessment Started ===" | Set-Content -Path $script:Log -Force -Encoding UTF8
+        Write-Info -m "Initalized $($script:Log)"
     } catch {
         Write-Info "Failed initalizing $($script:Log)" -lvl Error -ex $_
     }
@@ -1920,7 +1927,8 @@ function Initialize-BRAVE {
         Write-Info -m "Failed creating $($script:Directory)" -lvl Error -ex $_ -show "Failed creating BRAVE directory"
     }
 
-    # 3
+    
+    # 3. Inialize Active Directory
     Write-Info -m "Initializing AD varaibles"
     
     $script:LogonAge = 90 # Stale age thresholds
@@ -1942,21 +1950,24 @@ function Initialize-BRAVE {
             Write-Info -m "Get-ADDomainController failed" -lvl Error -ex $_
         }
 
-        $script:PrivilegedGroups = @{ # Privileged groups for recursive lookups
+        try {
+            $script:PrivilegedGroups = @{ # Privileged groups for recursive lookups
             "Enterprise Admins" = "$($script:ADDomain.DomainSID.Value)-519" # Universal scope
             "Domain Admins"     = "$($script:ADDomain.DomainSID.Value)-512" # Domain scope
             "Schema Admins"     = "$($script:ADDomain.DomainSID.Value)-518" # Forest scope
             "*Administrators"    = "S-1-5-32-544"                            # Built-in
             "Protected Users"   = "$($script:ADDomain.DomainSID.Value)-525" # Security group
             "Server Operators"   = "$($script:ADDomain.DomainSID.Value)-554" # Security group
+            }
+        } catch {
+            Write-Info -m "Privileged groups" -lvl Error -ex $_
         }
-        Write-Info -m "Priviliged groups: $($script:PrivilegedGroups)"
     } catch {
-        Write-Info -m "Failed AD initalization" -lvl Error -ex $_ -show "Failed to initalize Active Directory"
+        Write-Info -m "Failed AD initalization" -lvl Error -ex $_ -show "Failed initalizing Active Directory"
         return $false
     }
     
-    # 4
+    # 4. Initalize user properties to query
     $script:UserProperties = @(
         'SAMAccountname',   'Enabled',        'Name',
         'DisplayName',      'LastLogonDate',  'Created',
@@ -1971,9 +1982,8 @@ function Initialize-BRAVE {
         'DistinguishedName',
         'CanonicalName',   'ServicePrincipalName'
     )
-    Write-Info -m "UserProperties: $($script:UserProperties)" -lvl Debug
 
-     # 5
+     # 5. Broadcast Status
      $summary = @(
         "SCRIPT: v$script:Version"
         "START:  $(FormatValue $script:StartTime -Format Write)"
@@ -1997,12 +2007,10 @@ function Initialize-BRAVE {
     ) -join "`n"
 
     Write-Info -m "$($details)" -lvl Status -show "$($summary)"
-    
-    # 6
-    $ModuleList = $script:RequiredModules  # Add this line
-    
+
+     # 5. Prereqs
     Write-Info -m "Checking prerequisites" -show "CHECKING PREREQUISITES" -lvl header
-    Write-Info -m "ModuleList: $($ModuleList -join ', ')" -lvl Debug
+    Write-Info -m "Required modules: $($script:RequiredModules -join ', ')" -lvl Debug
     function Test-RSATInstallation {
         param (
             [bool]$isServer
@@ -2011,26 +2019,24 @@ function Initialize-BRAVE {
         $rsatStatus = $false
         try {
             if ($isServer) {
+                $installCommand = { Install-WindowsFeature -Name RSAT-AD-PowerShell -ErrorAction Stop }
                 try {
                     $rsat = Get-WindowsFeature RSAT-AD-PowerShell -ErrorAction Stop # ErrorAction Stop
                     $isInstalled = $rsat.InstallState -eq 'Installed'
-                    $installCommand = { Install-WindowsFeature -Name RSAT-AD-PowerShell -ErrorAction Stop }
                     Write-Info -m "RSAT Installed on Server"
                 } catch {
-                    Write-Info -m "Failed checking RSAT on Server" -lvl Warn -ex $_
                     $isInstalled = $false
-                    $installCommand = { Install-WindowsFeature -Name RSAT-AD-PowerShell -ErrorAction Stop }
+                    Write-Info -m "Failed checking RSAT on Server" -lvl Warn -ex $_
                 }
             } else {
+                $installCommand = { Add-WindowsCapability -Name "Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0" -Online -ErrorAction Stop }
                 try {
                     $rsat = Get-WindowsCapability -Name "Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0" -Online -ErrorAction Stop  # ErrorAction Stop
                     $isInstalled = $rsat.State -eq 'Installed'
-                    $installCommand = { Add-WindowsCapability -Name "Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0" -Online -ErrorAction Stop }
                     Write-Info -m "RSAT Installed on Workstation"
                 } catch {
-                    Write-Info -m "Failed checking RSAT on Workstation" -lvl Warn -ex $_
                     $isInstalled = $false
-                    $installCommand = { Add-WindowsCapability -Name "Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0" -Online -ErrorAction Stop }
+                    Write-Info -m "Failed checking RSAT on Workstation" -lvl Warn -ex $_
                 }
             }
     
@@ -2045,7 +2051,7 @@ function Initialize-BRAVE {
                     Write-Info -m "RSAT install failed - continuing with limited functionality" -lvl Warn -ex $_ -show "RSAT: Dailed"
                 }
             } else {
-                Write-Info -m "RSAT is installed" -show "RSAT: Ready"
+                Write-Info -m "RSAT installed" -show "RSAT: Ready"
                 $rsatStatus = $true
             }
         } catch {
@@ -2058,10 +2064,10 @@ function Initialize-BRAVE {
         param (
             [string]$ModuleName
         )
-    
+        Write-Info -m "Running Test-ModuleAvailability"
         try {
             # Check if module is already loaded
-            if (Get-Module -Name $ModuleName) {
+            if (Get-Module -Name $($ModuleName)) {
                 Write-Info -m "Module already loaded: $($ModuleName)"
                 return "Ready"
             }
@@ -2137,9 +2143,9 @@ function Initialize-BRAVE {
         
         try {
             $moduleResults[$module] = Test-ModuleAvailability -ModuleName $module
-            Write-Info -m "$module processed"
+            Write-Info -m "Processed $($module)"
         } catch {
-            Write-Info -m "$module failed processing"
+            Write-Info -m "$($module) failed processing"
             $moduleResults[$module] = "Error"
         }
     }
@@ -2154,12 +2160,14 @@ function Initialize-BRAVE {
     }
     
     $moduleSuccess = ($moduleResults.Values | Where-Object { $_ -ne "Ready" }).Count -eq 0 # All modules ready
+    Write-Info -m "Module check success: $moduleSuccess"
 
     if (-not ($rsatInstalled -and $moduleSuccess)) { # One or more failed
         $failedComponents = @() # List of failed components
         
         if (-not $rsatInstalled) { # RSAT failed
-            $failedComponents += "RSAT" 
+            $failedComponents += "RSAT"
+            Write-Info -m "RSAT failed" 
         }
         
         if (-not $moduleSuccess) { # One or more modules failed
@@ -2167,6 +2175,7 @@ function Initialize-BRAVE {
                 Where-Object { $_.Value -ne "Ready" } | 
                 ForEach-Object { $_.Key }
             $failedComponents += "Modules: $($failedModules -join ', ')"
+            Write-Info -m "Modules failed"
         }
         
         $errorMessage = "Prerequisite Checks Failed: $($failedComponents -join '; ')" # Error message
@@ -2174,9 +2183,9 @@ function Initialize-BRAVE {
         Write-Info -m $errorMessage -lvl Warn
         
         throw $errorMessage # Throw error to stop script
+        Write-Info -m "Threw $($errorMessage)"
     }
-    Write-Info -m "POWERSHELL: READY"
-    Write-Info -m "DONE" -lvl done
+    Write-Info -m "PowerShell: Ready" -show "PowerShell: Ready"
     return $true # All prerequisites met
 }
 
@@ -2189,16 +2198,16 @@ function Start-BRAVE {
     Write-Info -m "Start-BRAVE running"
 
     try {
-       
-        # 1 Discover functions to turn into scriptblocks
+        # 1. Discover functions to turn into scriptblocks
         Write-Info -m "Discovering Get-* functions"
-        
+        Write-Info -m "Script Path: $PSCommandPath" -lvl Debug
+
         $getFunctions = Get-Command -CommandType Function | 
             Where-Object {
                 $_.ScriptBlock.File -eq $PSCommandPath -and 
                 $_.Name -like 'Get-*'
             }
-                
+                    
         $scriptblocks = @($getFunctions | ForEach-Object { [scriptblock]::Create($_.Name) })
         $functionNames = $scriptblocks | ForEach-Object { $_.ToString() }
         Write-Info -m "Executing: $($functionNames -join ', ')" -lvl Debug
@@ -2223,110 +2232,110 @@ function Start-BRAVE {
             }
         } 
 
+
+        #2. Create archive file
         Write-Info -m "Creating archive file" -show "CREATING ARCHIVE FILE" -lvl Header
 
-        # 5. Create archive file
-            $itemsToArchive = Get-ChildItem -Path $script:Directory -File # Get items to archive
-            $itemsToArchive += Get-ChildItem -Path $script:Directory -Directory | # Get items to archive
-                Where-Object { $_.FullName -ne $script:GPODirectory }
+        try {
+            # Get all items to archive
+            $itemsToArchive = @()
+            $itemsToArchive += @(Get-ChildItem -Path $script:Directory -File)
+            $itemsToArchive += @(Get-ChildItem -Path $script:Directory -Directory | 
+                Where-Object { $_.FullName -ne $script:GPODirectory })
 
             Write-Info -m "File Count: $($itemsToArchive.Count)" -lvl Debug
             Write-Info -m "Archiving: $($itemsToArchive.Name -join ', ')" -lvl Debug
 
-            try {
-                if ($itemsToArchive) { # Create .zip
-                    try {
-                        $nonLogFiles = $itemsToArchive | Where-Object { $_.FullName -ne $script:Log }
+            if ($itemsToArchive.Count -gt 0) {
+                try {
+                    $nonLogFiles = $itemsToArchive | Where-Object { $_.FullName -ne $script:Log }
+                    if ($nonLogFiles) {
                         Compress-Archive -Path $nonLogFiles.FullName -DestinationPath $script:Archive -Force
                         Write-Info -m "Added: $($nonLogFiles.FullName -join ', ')" -lvl Debug
-                        Write-Info -m "Sleeping"
                         Start-Sleep -Milliseconds 500
-                    } catch {
-                        Write-Info -m "Failed creating zip" -lvl Error -ex $_
                     }
-                }
-
-                if (Test-Path $script:GPODirectory) { # Add GPO folder
-                    try {
-                        Compress-Archive -Path $script:GPODirectory -DestinationPath $script:Archive -Update
-                        Write-Info -m "Added $($script:GPODirectory) to  $($script:Archive)" -lvl Debug
-                        Write-Info -m "Sleeping"
-                        Start-Sleep -Milliseconds 500
-                    } catch {
-                        Write-Info -m "Failed adding $($script:GPODirectory) to $($script:Archive)" -lvl Warn -ex $_
-                    }
-                }
-
-                # Add invoked script
-                try {
-                    Compress-Archive -Path $PSCommandPath -DestinationPath $script:Archive -Update
-                    Write-Info -m "Added $($PSCommandPath) to $($script:Archive)" -lvl Debug
-                    Write-Info -m "Sleeping"
-                    Start-Sleep -Milliseconds 250
                 } catch {
-                    Write-Info -m "Failed adding $($PSCommandPath) to $($script:Archive)" -lvl Warn -ex $_
+                    Write-Info -m "Failed creating zip" -lvl Error -ex $_
                 }
+            }
 
-                Write-Info -m 'DONE' -lvl Done 
-
-                # Write summary
-                $duration = [datetime]::UtcNow - $script:StartTime
-                $durationFormatted = if ($duration.TotalHours -ge 1) {
-                    $duration.ToString('hh\:mm\:ss')
-                } else {
-                    $duration.ToString('mm\:ss')
+            # Add GPO folder if it exists
+            if (Test-Path $script:GPODirectory) {
+                try {
+                    Compress-Archive -Path $script:GPODirectory -DestinationPath $script:Archive -Update
+                    Write-Info -m "Added $($script:GPODirectory) to $($script:Archive)" -lvl Debug
+                    Start-Sleep -Milliseconds 500
+                } catch {
+                    Write-Info -m "Failed adding $($script:GPODirectory) to $($script:Archive)" -lvl Warn -ex $_
                 }
+            }
 
-                $summary = @(
-                    "STARTED:  $(FormatValue $script:StartTime -Format Write)"
-                    "FINISHED: $(FormatValue ([datetime]::UtcNow) -Format Write)"
-                    "DURATION: $durationFormatted"
-                    "CREATED:  $script:Archive"
-                ) -join "`n"
-
-                Write-Info  "$summary"
-                Write-Info -m "=== BRAVE Assessment Complete ==="
-                Start-Sleep -Milliseconds 500
-
-                # Add log file
-                Compress-Archive -Path $script:Log -DestinationPath $script:Archive -Update
-                Write-Log -Message "Added $($script:Log) to $($script:Archive)" -Level INFO
-                Start-Sleep -Milliseconds 500
-
-                # Verify archive and cleanup
-                if (Test-Path $script:Archive) {
-                    if (& $script:Validate -Path $script:Archive) {
-                        try { # Cleanup
-                            Get-ChildItem -Path $script:Directory -Exclude (Split-Path $script:Log -Leaf) |
-                                Remove-Item -Recurse -Force -Confirm:$false
-                            Remove-Item -Path $script:Log -Force
-                            Remove-Item -Path $script:Directory -Force
-                        }
-                        catch {
-                            Write-Log -Message "Failed post clean up: $_" -Level ERROR
-                        }
-                    }
-                    else {
-                        Write-Log -Message "Archive validation failed - skipping cleanup" -Level WARN
-                        Write-Console -Message "Archive failed" -Type warn
-                    }
-                }
-                else {
-                    Write-Log -Message "Archive not found - skipping cleanup" -Level WARN
-                    Write-Console -Message "Archive not found" -Type warn
-                }
+            # Add invoked script
+            try {
+                Compress-Archive -Path $PSCommandPath -DestinationPath $script:Archive -Update
+                Write-Info -m "Added $($PSCommandPath) to $($script:Archive)" -lvl Debug
+                Start-Sleep -Milliseconds 250
             } catch {
-                Write-Warning "Error creating archive: $_"
+                Write-Info -m "Failed adding $($PSCommandPath) to $($script:Archive)" -lvl Warn -ex $_
+            }
+
+                        Write-Info -m 'DONE' -lvl Done 
+
+                        # Write summary
+                        $duration = [datetime]::UtcNow - $script:StartTime
+                        $durationFormatted = if ($duration.TotalHours -ge 1) {
+                            $duration.ToString('hh\:mm\:ss')
+                        } else {
+                            $duration.ToString('mm\:ss')
+                        }
+
+                        $summary = @(
+                            "STARTED:  $(FormatValue $script:StartTime -Format Write)"
+                            "FINISHED: $(FormatValue ([datetime]::UtcNow) -Format Write)"
+                            "DURATION: $durationFormatted"
+                            "CREATED:  $script:Archive"
+                        ) -join "`n"
+
+                        Write-Info  "$summary"
+                        Write-Info -m "=== BRAVE Assessment Complete ==="
+                        Start-Sleep -Milliseconds 500
+
+                        # Add log file
+                        Compress-Archive -Path $script:Log -DestinationPath $script:Archive -Update
+                        Write-Log -Message "Added $($script:Log) to $($script:Archive)" -Level INFO
+                        Start-Sleep -Milliseconds 500
+
+                        # Verify archive and cleanup
+                        if (Test-Path $script:Archive) {
+                            if (& $script:Validate -Path $script:Archive) {
+                                try { # Cleanup
+                                    Get-ChildItem -Path $script:Directory -Exclude (Split-Path $script:Log -Leaf) |
+                                        Remove-Item -Recurse -Force -Confirm:$false
+                                    Remove-Item -Path $script:Log -Force
+                                    Remove-Item -Path $script:Directory -Force
+                                }
+                                catch {
+                                    Write-Log -Message "Failed post clean up: $_" -Level ERROR
+                                }
+                            }
+                            else {
+                                Write-Info -m "Archive validation failed - skipping cleanup" -lvl Warn -ex $_ -show "Archive not found"
+                            }
+                        }
+                        else {
+                            Write-Info -m "Archive not found - skipping cleanup" -lvl Warn -ex $_ -show "Archive not found"
+                        }
+                    } catch {
+                        Write-Warning "Error creating archive: $_"
+                        throw
+                    }
+            } catch {
                 throw
             }
+            finally {
+                Write-Progress -Activity "Executing BRAVE Script" -Completed
+            }
         }
-    catch {
-        throw
-    }
-    finally {
-        Write-Progress -Activity "Executing BRAVE Script" -Completed
-    }
-}
 
 # Main script execution block
 Write-Info -m "Main script block"
@@ -2341,7 +2350,7 @@ try {
         Write-Info -m "Initalized-BRAVE succeeded"
         Start-BRAVE
     }
-    Write-Log -Message "Script Execution complete" -Level INFO
+    Write-Info -m"Script Execution complete"
 } 
 catch {
     Write-Info -m "Main script block failed" -lvl Error -ex $_ -show "BRAVE failed executing"
