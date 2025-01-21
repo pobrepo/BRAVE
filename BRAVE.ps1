@@ -453,11 +453,11 @@ function Get-ActiveDirectory {
     [CmdletBinding()]
     param()
     
-    Write-Info -m "QUERYING ACTIVE DIRECTORY" -lvl header
+    Write-Info -m "Starting Get-AtciveDirectory" -lvl header -show "QUERYING ACTIVE DIRECTORY" 
 
     try {
         $controls = [ordered]@{
-            'Runtime' = {
+            'RUNTIME' = {
                 $system = Get-CimInstance -ClassName Win32_ComputerSystem
                 $networkKey = if ($system.PartOfDomain) {'Domain-joined'} else {'Workgroup-joined'}
                 $networkValue = if ($system.PartOfDomain) {$system.Domain} else {$system.Workgroup}
@@ -483,7 +483,7 @@ function Get-ActiveDirectory {
                 $result
             }
 
-            'Forest' = {
+            'FOREST' = {
                 @{ 
                     'Name' = $script:ADForest.Name
                     'Mode' = $script:ADForest.ForestMode
@@ -494,7 +494,7 @@ function Get-ActiveDirectory {
                 }
             }
     
-            'Domain' = {
+            'DOMAIN' = {
                 @{ 
                     'DNSRoot' = $script:ADDomain.DNSRoot
                     'NetBIOS' = $script:ADDomain.NetBIOSName
@@ -506,14 +506,14 @@ function Get-ActiveDirectory {
                 }
             }
 
-            'Dcs' = {
+            'DCs' = {
                 
                 $script:DCs | & $script:Export -Name $section # Export details
                 @{ } # Empty hashtable; exclude from -IsSummary
 
             }
 
-            'Backup' = { 
+            'BACKUP' = { 
                 # Get partitions
                 $rootDSE = Get-ADRootDSE -Server $script:ADDomain.PDCEmulator
                 $partitions = $rootDSE.namingContexts
@@ -571,7 +571,7 @@ function Get-ActiveDirectory {
                 }
             }
     
-            'Fsmo' = {
+            'FSMO' = {
                 @{
                     'Schema' = $script:ADForest.SchemaMaster
                     'Naming' = $script:ADForest.DomainNamingMaster
@@ -581,7 +581,7 @@ function Get-ActiveDirectory {
                 }
             }
 
-            'Trusts' = {
+            'TRUSTS' = {
                 $trusts = Get-ADTrust -Filter * -Server $script:ADDomain.PDCEmulator | 
                     Select-Object Source, Target, Direction, IntraForest, SelectiveAuth, 
                         SIDFilteringForestAware, SIDFilteringQuarantinedDirection
@@ -609,14 +609,11 @@ function Get-ActiveDirectory {
                 }
             }
 
-            'Sid500' = {
+            'SID500' = {
                 $administrator = Get-ADUser -Identity "$($script:ADDomain.DomainSID.Value)-500" `
                     -Properties $script:UserProperties -Server $script:ADDomain.PDCEmulator
 
                 if ($administrator) {
-                    # Export detailed data
-                    $administrator | & $script:Export -Name $section
-
                     # Return summary hashtable
                     @{
                         'SamAccountName' = $administrator.SamAccountName
@@ -638,7 +635,7 @@ function Get-ActiveDirectory {
                 }
             }
 
-            'Privileged' = {
+            'PRIVILIGED' = {
                 $groups = @()
                 $accessPaths = @{}
                 $summary = @{}
@@ -774,7 +771,7 @@ function Get-ActiveDirectory {
                 }
             }
 
-            'Users' = {
+            'USERS' = {
                 $users = Get-ADUser -Filter * -Properties $script:UserProperties -Server $script:ADDomain.PDCEmulator
 
                 if ($users) {
@@ -818,36 +815,36 @@ function Get-ActiveDirectory {
             }
 
             'TOMBSTONE' = {
-                try {
-                    $tombstone = Get-ADObject -Identity "CN=Directory Service,CN=Windows NT,CN=Services,$((Get-ADRootDSE).configurationNamingContext)" `
-                        -Properties tombstoneLifetime -Server $script:ADDomain.PDCEmulator
-                    
+                $tombstone = Get-ADObject -Identity "CN=Directory Service,CN=Windows NT,CN=Services,$((Get-ADRootDSE).configurationNamingContext)" `
+                    -Properties tombstoneLifetime -Server $script:ADDomain.PDCEmulator
+                
+                if ($tombstone) {
                     @{
                         'TombstoneLifetime (day)' = [int]$tombstone.tombstoneLifetime
-                    } | & $script:Export -Name $section -IsSummary
-                } catch {
-                    & $script:Error $section "Failed gathering $section"
+                    }
+                } else {
+                    @{ 'TombstoneLifetime (day)' = "Not foud" }
                 }
             }
     
             'DSHEURISTICS' = {
-                try {
-                    $configuration = (Get-ADRootDSE).configurationNamingContext
-                    $ds = Get-ADObject -Filter 'objectClass -eq "nTDSService"' `
-                        -SearchBase $configuration -Properties dSHeuristics -Server $script:ADDomain.PDCEmulator
-                    
+                $configuration = (Get-ADRootDSE).configurationNamingContext
+                $ds = Get-ADObject -Filter 'objectClass -eq "nTDSService"' `
+                    -SearchBase $configuration -Properties dSHeuristics -Server $script:ADDomain.PDCEmulator
+                
+                if ($ds) {
                     @{
                         'Attribute' = if ($ds.dSHeuristics) { $ds.dSHeuristics } else { "<null>" }
-                    } | & $script:Export -Name $section -IsSummary
-                } catch {
-                    & $script:Error $section "Failed gathering $section"
+                    }
+                } else {
+                    @{ 'Attribute' = "Not found" }
                 }
             }
 
             'PASSWORDPOLICY' = {
-                try {
-                    $policy = Get-ADDefaultDomainPasswordPolicy -Server $script:ADDomain.PDCEmulator
-                    
+                $policy = Get-ADDefaultDomainPasswordPolicy -Server $script:ADDomain.PDCEmulator
+                
+                if ($policy) {
                     @{
                         'ComplexityEnabled' = $policy.ComplexityEnabled
                         'MinPasswordLength' = $policy.MinPasswordLength
@@ -857,112 +854,101 @@ function Get-ActiveDirectory {
                         'LockoutDuration (min)' = $policy.LockoutDuration.TotalMinutes
                         'PasswordHistoryCount' = $policy.PasswordHistoryCount
                         'ReversibleEncryptionEnabled' = $policy.ReversibleEncryptionEnabled
-                    } | & $script:Export -Name $section -IsSummary
-                } catch {
-                    & $script:Error $section "Failed gathering $section"
+                    }
+                } else {
+                    @{}.GetEnumerator() + $(
+                        $policy.PSObject.Properties.Name | ForEach-Object { 
+                            @{ $_ = "Not found" }
+                        }
+                    )
                 }
             }
 
             'GROUPPOLICY' = {
+                # Create subfolder
                 try {
-                    
-                    # Create subfolder
-                    try {
-                        New-Item -Path $script:GPODirectory -ItemType Directory -Force > $null
-                    } catch {
-                        Write-Log -Message "Failed creating $($script:GPODirectory)" -Level WARN
-                    }
-                    
-                    # Get GPOs
-                    try {
-                        $Gpos = Get-GPO -All -Server $script:ADDomain.PDCEmulator
-                        Write-Log -Message "GPOs: $($Gpos.Count)" -Level INFO
-                    } catch {
-                        Write-Log -Message "Failed gahtering GPOs" -Level WARN
-                    }
-                    
-                    if ($Gpos) {
-                        foreach ($gpo in $Gpos) {
-                            # Export GPOs
-                            try {
-                                [xml]$reports = Get-GPOReport -ReportType Xml -Guid $gpo.Id -Server $script:ADDomain.PDCEmulator
-                                if ($null -ne $reports.GPO.Name) {
-                                    Get-GPOReport -Name $reports.GPO.Name -ReportType Html -Path (Join-Path $script:GPODirectory "$($reports.GPO.Name).html") -Server $script:ADDomain.PDCEmulator
-                                    Get-GPOReport -Name $reports.GPO.Name -ReportType Xml -Path (Join-Path $script:GPODirectory "$($reports.GPO.Name).xml") -Server $script:ADDomain.PDCEmulator
-                                    Write-Log -Message "Exported $($reports.GPO.Name)" -Level INFO
-                                }
-                            } catch {
-                                Write-Log -Message "Failed exporting $($gpo.DisplayName)" -Level WARN
-                            }
-                            
-                            try { # Security groups applied to
-                                $security = $gpo.GetSecurityInfo($true)  # $true includes inherited permissions
-                                $permissions = @($security | ForEach-Object {
-                                    $source = if ($_.Inherited) { 
-                                        "Inherited" 
-                                    } else { 
-                                        "Direct"
-                                    }
-                                    "$($_.Trustee) ($($_.TrusteeType)) [$source] - $($_.Permission)"
-                                } | Sort-Object)
-                            } catch {
-                                $permissions = @("Error getting permissions")
-                                Write-Log -Message "Failed gathering permissions: $($gpo.DisplayName)" -Level WARN
-                            }
-                            
-                            try { # OUs linked to
-                                $links = $gpo.GetReport().LinksTo | ForEach-Object { $_.SOMPath }
-                            } catch {
-                                $links = @("Error getting links")
-                                Write-Log -Message "Error getting linked OUs: $($gpo.DisplayName)" -Level WARN
-                            }
-
-                            # Export details
-                            try {
-                                [ordered]@{
-                                    'Name' = $gpo.DisplayName
-                                    'Owner' = $gpo.Owner
-                                    'Status' = $gpo.GpoStatus
-                                    'Linked OUs' = $links -join '; '
-                                    'Security Filtering' = $permissions -join '; '
-                                    'Description' = $gpo.Description
-                                    'CreationTime' = & $script:FormatValue $gpo.CreationTime
-                                    'ModificationTime' = & $script:FormatValue $gpo.ModificationTime
-                                    'UserVersion' = $gpo.User.DSVersion
-                                    'ComputerVersion' = $gpo.Computer.DSVersion
-                                    'WmiFilter' = if ($gpo.WmiFilter) { $gpo.WmiFilter.Name } else { "None" }
-                                    'ID' = $gpo.Id
-                                } | & $script:Export -Name $section
-                            } catch {
-                                Write-Log -Message "Failed exporting: $($gpo.DisplayName) $_" -Level ERROR
-                            }
-                            
-                            # Export summary
-                            [ordered]@{
-                                'Total' = $Gpos.Count
-                                'Disabled' = ($Gpos | Where-Object { $_.GpoStatus -eq 'AllSettingsDisabled' }).Count
-                                'Orphaned' = ($Gpos | Where-Object { 
-                                    try { 
-                                        -not $_.GetReport().LinksTo 
-                                    } catch { 
-                                        $true 
-                                    }
-                                }).Count
-                            } | & $script:Export -Name $section -IsSummary
-
-                        } 
-                    } else {
-                        [PSCustomObject]@{
-                        } | & $script:Export -Name "$section-NONE-FOUND"
-                    }
+                    New-Item -Path $script:GPODirectory -ItemType Directory -Force > $null
                 } catch {
-                    & $script:Error $section "Failed gathering $section"
+                    Write-Log -Message "Failed creating $($script:GPODirectory)" -Level WARN
+                }
+                
+                # Get GPOs
+                try {
+                    $Gpos = Get-GPO -All -Server $script:ADDomain.PDCEmulator
+                    Write-Log -Message "GPOs: $($Gpos.Count)" -Level INFO
+                } catch {
+                    Write-Log -Message "Failed gathering GPOs" -Level WARN
+                }
+                
+                if ($Gpos) {
+                    foreach ($gpo in $Gpos) {
+                        # Export GPOs
+                        try {
+                            [xml]$reports = Get-GPOReport -ReportType Xml -Guid $gpo.Id -Server $script:ADDomain.PDCEmulator
+                            if ($null -ne $reports.GPO.Name) {
+                                Get-GPOReport -Name $reports.GPO.Name -ReportType Html -Path (Join-Path $script:GPODirectory "$($reports.GPO.Name).html") -Server $script:ADDomain.PDCEmulator
+                                Get-GPOReport -Name $reports.GPO.Name -ReportType Xml -Path (Join-Path $script:GPODirectory "$($reports.GPO.Name).xml") -Server $script:ADDomain.PDCEmulator
+                                Write-Log -Message "Exported $($reports.GPO.Name)" -Level INFO
+                            }
+                        } catch {
+                            Write-Log -Message "Failed exporting $($gpo.DisplayName)" -Level WARN
+                        }
+                        
+                        try { # Security groups applied to
+                            $security = $gpo.GetSecurityInfo($true) # $true indicates inherited
+                            $permissions = @($security | ForEach-Object {
+                                $source = if ($_.Inherited) { "Inherited" } else { "Direct" }
+                                "$($_.Trustee) ($($_.TrusteeType)) [$source] - $($_.Permission)"
+                            } | Sort-Object)
+                        } catch {
+                            $permissions = @("Error getting permissions")
+                            Write-Log -Message "Failed gathering permissions: $($gpo.DisplayName)" -Level WARN
+                        }
+                        
+                        try { # OUs linked to
+                            $links = $gpo.GetReport().LinksTo | ForEach-Object { $_.SOMPath }
+                        } catch {
+                            $links = @("Error getting links")
+                            Write-Log -Message "Error getting linked OUs: $($gpo.DisplayName)" -Level WARN
+                        }
+
+                        # Export details
+                        try {
+                            [ordered]@{
+                                'Name' = $gpo.DisplayName
+                                'Owner' = $gpo.Owner
+                                'Status' = $gpo.GpoStatus
+                                'Linked OUs' = $links -join '; '
+                                'Security Filtering' = $permissions -join '; '
+                                'Description' = $gpo.Description
+                                'CreationTime' = & $script:FormatValue $gpo.CreationTime
+                                'ModificationTime' = & $script:FormatValue $gpo.ModificationTime
+                                'UserVersion' = $gpo.User.DSVersion
+                                'ComputerVersion' = $gpo.Computer.DSVersion
+                                'WmiFilter' = if ($gpo.WmiFilter) { $gpo.WmiFilter.Name } else { "None" }
+                                'ID' = $gpo.Id
+                            } | & $script:Export -Name $section
+                        } catch {
+                            Write-Log -Message "Failed exporting: $($gpo.DisplayName) $_" -Level ERROR
+                        }
+                    }
+                    
+                    # Return summary data
+                    @{
+                        'Total' = $Gpos.Count
+                        'Disabled' = ($Gpos | Where-Object { $_.GpoStatus -eq 'AllSettingsDisabled' }).Count
+                        'Orphaned' = ($Gpos | Where-Object { try { -not $_.GetReport().LinksTo } catch { $true } }).Count
+                    }
+                } else {
+                    @{}.GetEnumerator() + $(
+                        @('Total','Disabled','Orphaned') | ForEach-Object { 
+                            @{ $_ = "Not found" }
+                        }
+                    )
                 }
             }
 
             'KRBTGT' = {
-                Write-Console -Message "$section" -Type info
-
                 try {
                     $krbtgt = Get-ADUser 'krbtgt' -Properties PasswordLastSet -Server $script:ADDomain.PDCEmulator
                     @{
@@ -1460,7 +1446,6 @@ function Get-ActiveDirectory {
             }
 
             'NETWORK' = {              
-                Write-Console -Message "$section" -Type info
                 
                 try {
                     # Registry keys to fetch
@@ -1502,7 +1487,6 @@ function Get-ActiveDirectory {
                                     # Store result for summary counting
                                     $result = [ordered]@{
                                         'Server' = $dc.Name
-                                        'Setting' = "Registry"
                                         'Key' = $key
                                         'Path' = $reg.Path
                                         'Value' = $value
@@ -1513,7 +1497,6 @@ function Get-ActiveDirectory {
                                     Write-Log -Message "Failed checking registry on $($dc.Name) for $key : $_" -Level WARN
                                     $result = [ordered]@{
                                         'Server' = $dc.Name
-                                        'Setting' = "Registry"
                                         'Key' = $key
                                         'Path' = $reg.Path
                                         'Value' = "Error: Unable to connect"
@@ -1586,7 +1569,7 @@ function Get-ActiveDirectory {
        
         $sectionsToProcess = $controls.Keys
         foreach ($section in $sectionsToProcess) {
-            Write-Info -m "Processing section: $section"
+            Write-Info -m "Processing section: $section" -show "$section"
             
             try {  # Nest each scriptblock in a try/catch
                 $scriptBlock = $controls[$section]
