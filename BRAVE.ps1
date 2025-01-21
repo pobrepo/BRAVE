@@ -949,79 +949,86 @@ function Get-ActiveDirectory {
             }
 
             'KRBTGT' = {
-                try {
-                    $krbtgt = Get-ADUser 'krbtgt' -Properties PasswordLastSet -Server $script:ADDomain.PDCEmulator
+                $krbtgt = Get-ADUser 'krbtgt' -Properties PasswordLastSet -Server $script:ADDomain.PDCEmulator
+                
+                if ($krbtgt) {
                     @{
-                        'PasswordLastSet' = FormatValue $krbtgt.PasswordLastSet -Format Write
-                        'Age (day)' = [math]::Round(((Get-Date) - (Get-ADUser 'krbtgt' -Properties PasswordLastSet -Server $script:ADDomain.PDCEmulator).PasswordLastSet).TotalDays)
-                    } | & $script:Export -Name $section -IsSummary
-                } catch {
-                    & $script:Error $section "Failed to check KRBTGT account"
+                        'PasswordLastSet' = & $script:FormatValue $krbtgt.PasswordLastSet
+                        'Age (day)' = [math]::Round((New-TimeSpan -Start $krbtgt.PasswordLastSet -End (Get-Date)).TotalDays)
+                    }
+                } else {
+                    @{}.GetEnumerator() + $(
+                        @('PasswordLastSet', 'Age (day)') | ForEach-Object { 
+                            @{ $_ = "Not found" }
+                        }
+                    )
                 }
             }
     
             'DELAGATION' = {
-                try {
-                    $delegatedAccounts = Get-ADObject -Filter {
-                        ((UserAccountControl -BAND 0x0080000) -OR 
-                        (UserAccountControl -BAND 0x1000000) -OR 
-                        (msDS-AllowedToDelegateTo -like '*') -OR 
-                        (msDS-AllowedToActOnBehalfOfOtherIdentity -like '*')) -AND 
-                        (PrimaryGroupID -ne '516') -AND 
-                        (PrimaryGroupID -ne '521')
-                    } -Properties @(
-                        "sAMAccountName", "Name", "ObjectClass", "PrimaryGroupID", 
-                        "UserAccountControl", "ServicePrincipalName", 
-                        "msDS-AllowedToDelegateTo", 
-                        "msDS-AllowedToActOnBehalfOfOtherIdentity",
-                        "DistinguishedName", "CanonicalName"
-                    ) -Server $script:ADDomain.PDCEmulator
+                $delegatedAccounts = Get-ADObject -Filter {
+                    ((UserAccountControl -BAND 0x0080000) -OR 
+                    (UserAccountControl -BAND 0x1000000) -OR 
+                    (msDS-AllowedToDelegateTo -like '*') -OR 
+                    (msDS-AllowedToActOnBehalfOfOtherIdentity -like '*')) -AND 
+                    (PrimaryGroupID -ne '516') -AND 
+                    (PrimaryGroupID -ne '521')
+                } -Properties @(
+                    "Name", "ObjectClass", "PrimaryGroupID", 
+                    "UserAccountControl", "ServicePrincipalName", 
+                    "msDS-AllowedToDelegateTo", 
+                    "msDS-AllowedToActOnBehalfOfOtherIdentity",
+                    "DistinguishedName"
+                ) -Server $script:ADDomain.PDCEmulator
 
-                    if ($delegatedAccounts) {
-                        $delegatedAccounts | ForEach-Object {
-                            [PSCustomObject]@{
-                                'Name' = $_.Name
-                                'DistinguishedName' = $_.DistinguishedName
-                                'Type' = $(switch ($true) {
-                                    { $_.UserAccountControl -BAND 0x0080000 } { 'Unconstrained' }
-                                    { $_.UserAccountControl -BAND 0x1000000 } { 'Constrained with Protocol Transition' }
-                                    { $_.'msDS-AllowedToActOnBehalfOfOtherIdentity' } { 'Resource-Based Constrained' }
-                                    { $_.'msDS-AllowedToDelegateTo' } { 'Constrained' }
-                                    default { 'Unknown' }
-                                })
-                                'Scope' = if ($_.UserAccountControl -BAND 0x0080000) { 
-                                    'All Services' 
-                                } else { 
-                                    'Specific Services' 
-                                }
-                                'Protocol' = if ($_.UserAccountControl -BAND 0x1000000) {
-                                    'Any (Protocol Transition)'
-                                } else {
-                                    'Kerberos'
-                                }
-                                'ServicePrincipalName' = $_.ServicePrincipalName -join '; '
-                                'DelegatedServices' = if ($_.'msDS-AllowedToDelegateTo') {
-                                    $_.'msDS-AllowedToDelegateTo' -join '; '
-                                } else {
-                                    'N/A'
-                                }
-                            } | & $script:Export -Name $section
+                if ($delegatedAccounts) {
+                    # Export details
+                    $delegatedAccounts | ForEach-Object {
+                        # Determine delegation services and type
+                        $delegationServices = if ($_.UserAccountControl -BAND 0x0080000) { 
+                            'All Services'
+                        } else { 
+                            'Specific Services'
                         }
 
-                        # Add summary
-                        [ordered]@{
-                            'Total' = $delegatedAccounts.Count
-                            'Unconstrained' = ($delegatedAccounts | Where-Object { $_.UserAccountControl -BAND 0x0080000 }).Count
-                            'Constrained' = ($delegatedAccounts | Where-Object { $_.'msDS-AllowedToDelegateTo' }).Count
-                            'Resource-Based' = ($delegatedAccounts | Where-Object { $_.'msDS-AllowedToActOnBehalfOfOtherIdentity' }).Count
-                        } | & $script:Export -Name $section -IsSummary
-                    } else {
+                        $delegationType = switch ($true) {
+                            { $_.UserAccountControl -BAND 0x0080000 } { 'Unconstrained' }
+                            { $_.UserAccountControl -BAND 0x1000000 } { 'Constrained with Protocol Transition' }
+                            { $_.'msDS-AllowedToActOnBehalfOfOtherIdentity' } { 'Resource-Based Constrained Delegation' }
+                            { $_.'msDS-AllowedToDelegateTo' } { 'Constrained' }
+                            default { 'Unknown' }
+                        }
+
+                        $allowedProtocols = if ($_.UserAccountControl -BAND 0x1000000) {
+                            'Any (Protocol Transition)'
+                        } else {
+                            'Kerberos'
+                        }
+
                         [PSCustomObject]@{
-                            'Status' = "No Kerberos Delegation Found"
-                        } | & $script:Export -Name "$section-NONE-FOUND"
+                            'DistinguishedName' = $_.DistinguishedName
+                            'DelegationType' = $delegationType
+                            'Name' = $_.Name
+                            'ServicePrincipalName' = $_.ServicePrincipalName -join '; '
+                            'DelegationServices' = $delegationServices
+                            'AllowedProtocols' = $allowedProtocols
+                            'Domain' = $script:ADDomain.DNSRoot
+                        } | & $script:Export -Name $section
                     }
-                } catch {
-                    & $script:Error $section "Failed gathering $section"
+
+                    # Return summary data
+                    @{
+                        'Total' = $delegatedAccounts.Count
+                        'Unconstrained' = ($delegatedAccounts | Where-Object { $_.UserAccountControl -BAND 0x0080000 }).Count
+                        'Constrained' = ($delegatedAccounts | Where-Object { $_.'msDS-AllowedToDelegateTo' }).Count
+                        'Resource-Based' = ($delegatedAccounts | Where-Object { $_.'msDS-AllowedToActOnBehalfOfOtherIdentity' }).Count
+                    }
+                } else {
+                    @{}.GetEnumerator() + $(
+                        @('Total', 'Unconstrained', 'Constrained', 'Resource-Based') | ForEach-Object { 
+                            @{ $_ = "Not found" }
+                        }
+                    )
                 }
             }
  
