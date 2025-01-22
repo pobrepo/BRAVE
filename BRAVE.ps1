@@ -6,8 +6,8 @@
     Includes automated evidence collection for Veeam Backup & Replication, as an alternative to screenshots.
 .NOTES
     Author:         Patrick O'Brien
-    Date:           January 8, 2024
-    Purpose:        Consolidation of 'Trimarc' and 'Composite' scripts with standardized output, naming, time format, error handling, message handling.
+    Date:           January 22, 2024
+    Purpose:        Consolidation of 'Trimarc' and 'Composite' scripts with standardized output, naming, time format and error handling.
     Requirements:   PowerShell v5 (Run as Administrator), GroupPolicy PowerShell module, Remote Server Administration Tools (RSAT)
 .EXAMPLE
     PS> C:\temp\BRAVE.ps1
@@ -162,7 +162,7 @@ $script:Recursive = {
         return $results
     }
     catch {
-        Write-Log -Message "Error processing group '$GroupName': $_" -Level WARN
+        Write-Info -m "Error processing group $($GroupName)" -lvl Warn -ex $_
         
     }
 }
@@ -248,7 +248,7 @@ $script:Validate = {
         return $true
     }
     catch {
-        Write-Log -Message "Archive validation failed: $_" -Level ERROR
+        Write-Info -m "Archive validation failed" -lvl Error -ex $_
         return $false
     }
     finally {
@@ -265,7 +265,7 @@ function Write-Info {
         [Parameter(Mandatory = $true)]
         [string]$m,                                                                         # Required: -m "."      Message to write
 
-        [ValidateSet('Info', 'Done', 'Warn', 'Error', 'Debug', 'Header', 'Status')]         # Required: -lvl        Available levels
+        [ValidateSet('Info', 'Warn', 'Error', 'Debug', 'Header', 'Status')]         # Required: -lvl        Available levels
         [string]$lvl = 'Info',                                                              #                       Info is default -lvl if not specified
         [System.Management.Automation.ErrorRecord]$ex,                                      # Optional: -ex $_      Include exception details
         [string]$show,                                                                      # Optional: -show "."   User-facing message (regardless if -m is empty)
@@ -331,7 +331,6 @@ function Write-Info {
     if ($show) {                                                            # User-facing formatting for varoius -lvl {"Get-ADDomain -SpecicDetails" -lvl Warn} 
         switch ($lvl) {
             'Info'   { Write-Host $show -ForegroundColor Cyan }
-            'Done'   { Write-Host $show -ForegroundColor Green }
             'Debug'  { Write-Host $show -ForegroundColor White }
             'Warn'   { Write-Host "[*] $show" -ForegroundColor Yellow }
             'Error'  { Write-Host "[!] $show" -ForegroundColor Red }
@@ -347,97 +346,6 @@ function Write-Info {
     }
 }
 
-function Write-Log {
-    [CmdletBinding()]
-    param (
-        [Parameter(Mandatory = $true)]
-        [string]$Message,
-        [ValidateSet('INFO', 'WARN', 'ERROR', 'DEBUG')]
-        [string]$Level = 'INFO',
-        [System.Management.Automation.ErrorRecord]$Exception,
-        [switch]$PassThru
-    )
-
-    # Create timestamp
-    $logMessage = "[$(FormatValue -Format Write)] [$Level] $Message"
-    
-    # Exception handling
-    if ($Exception) {
-        $logMessage += "`nEXCEPTION DETAILS:"
-        $logMessage += "`n  Type: $($Exception.Exception.GetType().FullName)"
-        $logMessage += "`n  Message: $($Exception.Exception.Message)"
-        $logMessage += "`n  StackTrace: $($Exception.ScriptStackTrace)"
-        if ($Exception.InvocationInfo) {
-            $logMessage += "`n  Line: $($Exception.InvocationInfo.ScriptLineNumber)"
-            $logMessage += "`n  Position: $($Exception.InvocationInfo.PositionMessage)"
-        }
-    }
-
-    try {
-        if ([string]::IsNullOrEmpty($script:Log)) {
-            throw "Logfile null or empty $($script:Log)"
-        }
-        
-        # Write to log file
-        $logMessage | Out-File -FilePath $script:Log -Append -Force -Encoding UTF8
-
-    }
-    catch {
-        Write-Warning "Write-Log failed: $_"
-        Write-Warning "Message: $logMessage"
-        Write-Warning "Logfile: $script:Log"
-    }
-}
-
-function Write-Console {
-   [CmdletBinding()]
-    param (
-        [Parameter(Mandatory=$true)]
-        [string]$Message,
-        [ValidateSet("header", "info", "status", "done", "warn", "err")]
-        [string]$Type = "info",
-        [System.Management.Automation.ErrorRecord]$Exception
-    )
-
-    # Skip if message is empty or whitespace
-    if ([string]::IsNullOrWhiteSpace($Message)) {
-        Write-Log -Message "Empty message passed to Write-Console" -Level WARN
-        return
-    }
-
-    # Map message types to log levels
-    $logLevel = switch ($Type) {
-        "header" { "INFO" }
-        "info"   { "INFO" }
-        "done"   { "INFO" }
-        "warn"   { "WARN" }
-        "err"   { "ERROR" }
-    }
-
-    # Always write to log first
-    Write-Log -Message "Write-Console: $Message" -Level $logLevel -Exception $Exception
-
-    # Console output with formatting
-    switch ($Type) {
-        "header" {
-            Write-Host "`n------------------------------"
-            Write-Host $Message
-            Write-Host "------------------------------"
-        }
-        "info"   { Write-Host "$Message" -ForegroundColor Cyan }
-        "done"   { Write-Host "$Message" -ForegroundColor Green }
-        "warn"   { Write-Host "[*] $Message" -ForegroundColor Yellow }
-        "err"  { 
-            $consoleMessage = if ($Exception) {
-                "[!] Error: $Message. See log file."
-            } else {
-                "[!] $Message"
-            }
-            Write-Host $consoleMessage -ForegroundColor Red
-        }
-    }
-}
-#endregion ## WRITE ##
 
 #region ## REQIUREMENTS ##
 # Check PowerShell version
@@ -874,15 +782,15 @@ function Get-ActiveDirectory {
                 try {
                     New-Item -Path $script:GPODirectory -ItemType Directory -Force > $null
                 } catch {
-                    Write-Log -Message "Failed creating $($script:GPODirectory)" -Level WARN
+                    Write-Info -m "Failed creating $($script:GPODirectory)" -lvl Warn -ex $_
                 }
                 
                 # Get GPOs
                 try {
                     $Gpos = Get-GPO -All -Server $script:ADDomain.PDCEmulator
-                    Write-Log -Message "GPOs: $($Gpos.Count)" -Level INFO
+                    Write-Info -m "GPOs: $($Gpos.Count)"
                 } catch {
-                    Write-Log -Message "Failed gathering GPOs" -Level WARN
+                    Write-Info -m "Failed gathering GPOs" -lvl Warn -ex $_
                 }
                 
                 if ($Gpos) {
@@ -893,10 +801,10 @@ function Get-ActiveDirectory {
                             if ($null -ne $reports.GPO.Name) {
                                 Get-GPOReport -Name $reports.GPO.Name -ReportType Html -Path (Join-Path $script:GPODirectory "$($reports.GPO.Name).html") -Server $script:ADDomain.PDCEmulator
                                 Get-GPOReport -Name $reports.GPO.Name -ReportType Xml -Path (Join-Path $script:GPODirectory "$($reports.GPO.Name).xml") -Server $script:ADDomain.PDCEmulator
-                                Write-Log -Message "Exported $($reports.GPO.Name)" -Level INFO
+                                Write-Info -m "Exported $($reports.GPO.Name)"
                             }
                         } catch {
-                            Write-Log -Message "Failed exporting $($gpo.DisplayName)" -Level WARN
+                            Write-Info -m "Failed exporting $($gpo.DisplayName)" -lvl Warn -ex $_
                         }
                         
                         try { # Security groups applied to
@@ -907,14 +815,14 @@ function Get-ActiveDirectory {
                             } | Sort-Object)
                         } catch {
                             $permissions = @("Error getting permissions")
-                            Write-Log -Message "Failed gathering permissions: $($gpo.DisplayName)" -Level WARN
+                            Write-Info -m "Failed gathering permissions: $($gpo.DisplayName)" -lvl Warn -ex $_
                         }
                         
                         try { # OUs linked to
                             $links = $gpo.GetReport().LinksTo | ForEach-Object { $_.SOMPath }
                         } catch {
                             $links = @("Error getting links")
-                            Write-Log -Message "Error getting linked OUs: $($gpo.DisplayName)" -Level WARN
+                            Write-Info -m "Error getting linked OUs: $($gpo.DisplayName)" -lvl Warn -ex $_
                         }
 
                         # Export details
@@ -934,7 +842,7 @@ function Get-ActiveDirectory {
                                 'ID' = $gpo.Id
                             } | & $script:Export -Name $section
                         } catch {
-                            Write-Log -Message "Failed exporting: $($gpo.DisplayName) $_" -Level ERROR
+                            Write-Info -m "Failed exporting: $($gpo.DisplayName) $_" -lvl Error -ex $_
                         }
                     }
                     
@@ -1232,7 +1140,7 @@ function Get-ActiveDirectory {
             'SYSVOL' = {
                 try {
                     $results = foreach ($dc in $script:DCs) {
-                        Write-Log -Message "Processing SYSVOL on $($dc.Name)" -Level INFO
+                        Write-Inf- -m "Processing SYSVOL on $($dc.Name)"
                         
                         try {
                             # Recursively enumerate SYSVOL folders with depth limit
@@ -1260,7 +1168,7 @@ function Get-ActiveDirectory {
                                     }
                             }
                         } catch {
-                            Write-Log -Message "Failed to process DC: $($dc.Name): $_" -Level WARN
+                            Write-Info -m "Failed to process DC: $($dc.Name)" -lvl Warn -ex $_
                             continue
                         }
                     }
@@ -1440,7 +1348,7 @@ function Get-ActiveDirectory {
                                 IsSummary = $true
                             }
                         } catch {
-                            Write-Log -Message "Spooler checked failed: $($_.Name): $_" -Level WARN
+                            Write-Info -m "Spooler checked failed: $($_.Name): $_" -lvl Warn -ex $_
                             [PSCustomObject]@{
                                 DC = $_.Name
                                 Host = $_.HostName
@@ -1458,9 +1366,8 @@ function Get-ActiveDirectory {
             }
 
             'NETWORK' = {              
-                
                 try {
-                    # Registry keys to fetch
+                    # Define registry keys to check
                     $registryKeys = @(
                         @{
                             Path = "HKLM:\SYSTEM\CurrentControlSet\Services\LanManServer\Parameters"
@@ -1476,7 +1383,7 @@ function Get-ActiveDirectory {
                         }
                     )
 
-                    $results = foreach ($dc in $script:DCs) {
+                    foreach ($dc in $script:DCs) {
                         Write-Log -Message "Gathering registry on $($dc.Name)" -Level INFO
                         
                         # Check registry values
@@ -1486,35 +1393,27 @@ function Get-ActiveDirectory {
                                     $value = Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
                                         param($path, $key)
                                         try {
-                                            $val = Get-ItemProperty -Path $path -Name $key -ErrorAction Stop
-                                            if ($null -eq $val.$key) {
-                                                return "<null>"
-                                            }
+                                            $val = Get-ItemProperty -Path $path -Name $key
+                                            if ($null -eq $val.$key) { return "<null>" }
                                             return $val.$key
                                         } catch {
                                             return "Not Found"
                                         }
-                                    } -ArgumentList $reg.Path, $key -ErrorAction Stop
+                                    } -ArgumentList $reg.Path, $key
 
-                                    # Store result for summary counting
-                                    $result = [ordered]@{
+                                    [ordered]@{
                                         'Server' = $dc.Name
                                         'Key' = $key
-                                        'Path' = $reg.Path
                                         'Value' = $value
-                                    }
-                                    $result | & $script:Export -Name $section
-                                    $result # Output for results collection
+                                    } | & $script:Export -Name $section
+
                                 } catch {
                                     Write-Log -Message "Failed checking registry on $($dc.Name) for $key : $_" -Level WARN
-                                    $result = [ordered]@{
+                                    [ordered]@{
                                         'Server' = $dc.Name
                                         'Key' = $key
-                                        'Path' = $reg.Path
                                         'Value' = "Error: Unable to connect"
-                                    }
-                                    $result | & $script:Export -Name $section
-                                    $result # Output for results collection
+                                    } | & $script:Export -Name $section
                                 }
                             }
                         }
@@ -1528,51 +1427,32 @@ function Get-ActiveDirectory {
                                     if (Test-Path $tempPath) {
                                         $content = Get-Content $tempPath
                                         $lookup = $content | Select-String "LSAAnonymousNameLookup"
-                                        if ($lookup) {
-                                            return $lookup.ToString().Split('=')[1].Trim()
-                                        }
-                                        return "Not Found"
+                                        $value = if ($lookup) { $lookup.ToString().Split('=')[1].Trim() } else { "Not Found" }
+                                        Remove-Item -Path $tempPath -Force
+                                        return $value
                                     }
                                     return "Export Failed"
                                 } catch {
+                                    if (Test-Path $tempPath) { Remove-Item -Path $tempPath -Force }
                                     return "Error: $_"
-                                } finally {
-                                    if (Test-Path $tempPath) {
-                                        Remove-Item -Path $tempPath -Force
-                                    }
                                 }
-                            } 
+                            }
 
-                            $result = [ordered]@{
+                            [ordered]@{
                                 'Server' = $dc.Name
-                                'Setting' = "Security Policy"
                                 'Key' = "LSAAnonymousNameLookup"
-                                'Path' = "secedit /export"
                                 'Value' = $lsaValue
-                            }
-                            $result | & $script:Export -Name $section
-                            $result # Output for results collection
+                            } | & $script:Export -Name $section
+
                         } catch {
-                            Write-Log -Message "Failed secedit export on $($dc.Name): $_" -Level WARN
-                            $result = [ordered]@{
+                            Write-Info "Failed secedit export on $($dc.Name)" -lvl Warn -ex $_
+                            [ordered]@{
                                 'Server' = $dc.Name
-                                'Setting' = "Security Policy"
                                 'Key' = "LSAAnonymousNameLookup"
-                                'Path' = "secedit /export"
                                 'Value' = "Error: Unable to connect"
-                            }
-                            $result | & $script:Export -Name $section
-                            $result # Output for results collection
+                            } | & $script:Export -Name $section
                         }
                     }
-
-                    # Export summary
-                    [ordered]@{
-                        'Total Checks' = $results.Count
-                        'Successful' = ($results | Where-Object { $_.Value -notlike "Error:*" }).Count
-                        'Failed' = ($results | Where-Object { $_.Value -like "Error:*" }).Count
-                    } | & $script:Export -Name $section -IsSummary
-
                 } catch {
                     & $script:Error $section "Failed gathering $section"
                 }
@@ -1603,12 +1483,10 @@ function Get-ActiveDirectory {
             }
         }
     
-        Write-Log -Message "Get-BRAVE successfully completed" -Level INFO
-        Write-Console -Message "DONE" -Type done
+        Write-Info -m "Get-BRAVE successfully completed"
 
     } catch {
-        Write-Log -Message "Get-BRAVE Outtermost catch block failed $_" -Level ERROR
-        Write-Console -Message "Error gathering Active Directory details" -Type warn
+        Write-Info -m "Get-BRAVE Outtermost catch block failed" -lvl Warn -ex $_ - show "Error gathering Active Directory details"
     }
 }
 
@@ -1616,14 +1494,13 @@ function Get-CertificateServices {
     [CmdletBinding()]
     param()
     
-    Write-Console -Message "GATHERING CERTIFICATE SERVICES" -Type header
+    Write-Info -m "Gathering ADCS" -show "GATHERING CERTIFICATE SERVICES" -Type header
     
     # Basic sanity check
     try {
         $caCheck = certutil -ping
         if ($LASTEXITCODE -ne 0) {
-            Write-Log -Message "ADCS not found: $LASTEXITCODE" -Level DEBUG
-            Write-Console -Message "No Certificate Services" -Type done
+            Write-Info -m "ADCS not found: $LASTEXITCODE" -lvl Debug -show "No Certificate Services"
             
             @{
                 'CAs' = 0
@@ -1636,7 +1513,7 @@ function Get-CertificateServices {
         # Check PSPKI module
         $pspkiStatus = Test-ModuleAvailability -ModuleName $script:CertModule
         if ($pspkiStatus -ne "Ready") {
-            Write-Console -Message "PSPKI module not available" -Type warn
+            Write-Info -m "PSPKI module not available" -Type Warn -ex $_
             
             @{
                 'CAs' = 0
@@ -1646,11 +1523,10 @@ function Get-CertificateServices {
             return
         }
     } catch {
-        Write-Log -Message "Error checking Certificate Services: $_" -Level WARN
-        Write-Console -Message "Error checking Certificate Services" -Type warn
+        Write-Info -m "Error checking Certificate Services" -lvl Warn -ex $_ -show "Error checking Certificate Services" -Type warn
         
         @{
-            'CAs_Found' = 0
+            'CAs' = 0
             'Status' = 'Error checking Certificate Services'
         } | & $script:Export -Name "CertificateServices" -IsSummary
         
@@ -1667,14 +1543,14 @@ function Get-CertificateServices {
     }
 
     try { # Main CA assessment block
-        Write-Log -Message "Initiating CA discovery"
+        Write-Info -m "Initiating CA discovery"
         $cas = Get-CA -ErrorAction Stop
         
         if (-not $cas) {
-            Write-Console -Message "No Certificate Authorities found, skipping" -Type info
+            Write-Info -m "No Certificate Authorities found, skipping"
             
             @{
-                'CAs_Found' = 0
+                'CAs' = 0
                 'Status' = 'No CAs found in domain'
             } | & $script:Export -Name "CertificateServices" -IsSummary
             
@@ -1682,23 +1558,21 @@ function Get-CertificateServices {
         }
 
         $caNames = $cas | Where-Object {$_.Name} | Select-Object -ExpandProperty ComputerName
-        Write-Log -Message "Found CAs: $($caNames -join ', ')" -Level INFO
-        Write-Console -Message "Found $($caNames.Count) Certificate Authorities" -Type info
+        Write-Info -m "Found CAs: $($caNames -join ', ')" -show "Found $($caNames.Count) Certificate Authorities" -Type info
 
         # Template enumeration
-        Write-Log -Message "Beginning template enumeration using certutil"
         $templates = certutil -Template | Out-String
         
-        Write-Log -Message "Processing templates"
+        Write-Info -m "Processing templates"
         try {
             $templates | Export-Csv -Path $outputPaths.Templates -NoTypeInformation -Force
-            Write-Log -Message "Template exported to: $($outputPaths.Templates)"
+            Write-Info -m "Template exported to: $($outputPaths.Templates)"
         } catch {
-            Write-Log -Message "Failed exporting templates: $_" -Level ERROR
+            Write-Info -m "Failed exporting templates" -lvl Warn -ex $_
         }
     
         # Template permissions
-        Write-Log -Message "Beginning detailed template permission analysis"
+        Write-Info -m "Gathering template permissions"
         $filter = @()
         $maxEnrollPermissions = 0
 
@@ -1738,13 +1612,13 @@ function Get-CertificateServices {
         # Enrollment permissions
         try {
             $filter | Export-Csv -Path $outputPaths.Permissions -NoTypeInformation -Force
-            Write-Log -Message "Enrollment permissions exported: $($outputPaths.Permissions)"
+            Write-Info -m "Enrollment permissions exported: $($outputPaths.Permissions)"
         } catch {
-            Write-Log -Message "Failed exporting enrollment permissions: $_" -Level ERROR
+            Write-Info -m "Failed exporting enrollment permissions" -lvl Warn -ex $_
         }
 
         # CA Templates
-        Write-Log -Message "Processing CA template assignments"
+        Write-Info -m "Processing CA template assignments"
         try {
             $caTemplatesOutput = certutil -CATemplates | Out-String
             $caTemplates = @()
@@ -1756,26 +1630,26 @@ function Get-CertificateServices {
             
             # Export enrollments
             $caTemplates | Export-Csv -Path $outputPaths.Enrollment -NoTypeInformation -Force
-            Write-Log -Message "CA template assignments exported to: $($outputPaths.Enrollment)"
+            Write-Info -m "CA template assignments exported to: $($outputPaths.Enrollment)"
         } catch {
-            Write-Log -Message "Failed processing CA template assignments: $_" -Level ERROR
+           Write-Info -m "Failed processing CA template assignments" -lvl Error -ex $_
         }
 
         # NtAuth certificates
-        Write-Log -Message "Querying NtAuth certificates from AD"
+        Write-Info -m "Querying NtAuth certificates"
         try {
             $ntAuthPath = "CN=NtAuthCertificates,CN=Public Key Services,CN=Services,CN=Configuration,DC=$($script:ADDomain.DNSRoot -replace '\.',',DC=')"
             $ntAuthCerts = Get-ADObject -Filter * -SearchBase $ntAuthPath -Properties *
             
             $ntAuthCerts | Select-Object CanonicalName, CN, Created, Description, DisplayName, objectClass |
                 Export-Csv -Path $outputPaths.NTAuth -NoTypeInformation -Force
-            Write-Log -Message "NtAuth certificates exported to: $($outputPaths.NTAuth)"
+            Write-Info -m "NtAuth certificates exported to: $($outputPaths.NTAuth)"
         } catch {
-            Write-Log -Message "Failed processing NtAuth certificates: $_" -Level ERROR
+            Write-Info -m "Failed processing NtAuth certificates" -lvl Warn -ex $_
         }
 
         # Audit logging configuration
-        Write-Log -Message "Beginning audit configuration analysis"
+        Write-Info -m "Beginning audit configuration analysis"
         try {
             $auditResults = foreach ($ca in $cas) {
                 $sceValue = try {
@@ -1805,7 +1679,7 @@ function Get-CertificateServices {
             }
 
             $auditResults | Export-Csv -Path $outputPaths.Logging -NoTypeInformation -Force
-            Write-Log -Message "Audit configuration exported to: $($outputPaths.Logging)"
+            Write-Info -m "Audit configuration exported to: $($outputPaths.Logging)"
 
             # Templates security
             $templateAnalysis = $filter | ForEach-Object {
@@ -1866,14 +1740,12 @@ function Get-CertificateServices {
                 'Status' = 'Assessment completed'
             } | & $script:Export -Name "ADCS" -IsSummary
 
-            Write-Console -Message "DONE" -Type done
-
         } catch {
-            Write-Log -Message "Failed to process audit configuration: $_" -Level ERROR
+            Write-Info -m "Failed to process audit configuration" -lvl Error -ex $_
         }
 
     } catch {
-        Write-Log -Message "Certificate Services failed: $_" -Level ERROR
+        Write-Info -m "Certificate Services failed" -lvl Error -ex $_
     }
 }
 #endregion ## GET ##
@@ -2078,7 +1950,7 @@ function Initialize-BRAVE {
         # Check if module is installed
         if (Get-Module -ListAvailable -Name $ModuleName) {
             try {
-                Import-Module -Name $ModuleName -Force -Verbose:$false -ErrorAction Stop
+                Import-Module -Name $ModuleName -Force -Verbose:$false
                 Write-Info -m "Imported: $($ModuleName)"
                 return "Ready"
             } catch {
@@ -2279,8 +2151,6 @@ function Start-BRAVE {
                 Write-Info -m "Failed adding $($PSCommandPath) to $($script:Archive)" -lvl Warn -ex $_
             }
 
-                        Write-Info -m 'DONE' -lvl Done 
-
                         # Write summary
                         $duration = [datetime]::UtcNow - $script:StartTime
                         $durationFormatted = if ($duration.TotalHours -ge 1) {
@@ -2302,7 +2172,7 @@ function Start-BRAVE {
 
                         # Add log file
                         Compress-Archive -Path $script:Log -DestinationPath $script:Archive -Update
-                        Write-Log -Message "Added $($script:Log) to $($script:Archive)" -Level INFO
+                        Write-Info -m "Added $($script:Log) to $($script:Archive)"
                         Start-Sleep -Milliseconds 500
 
                         # Verify archive and cleanup
@@ -2315,7 +2185,7 @@ function Start-BRAVE {
                                     Remove-Item -Path $script:Directory -Force
                                 }
                                 catch {
-                                    Write-Log -Message "Failed post clean up: $_" -Level ERROR
+                                    Write-Info -m "Failed post cleanup" -lvl Error -ex $_
                                 }
                             }
                             else {
@@ -2326,7 +2196,7 @@ function Start-BRAVE {
                             Write-Info -m "Archive not found - skipping cleanup" -lvl Warn -ex $_ -show "Archive not found"
                         }
                     } catch {
-                        Write-Warning "Error creating archive: $_"
+                        Write-Info -m "Error creating archive" -lvl Error -ex $_ -show "Unable to create archive"
                         throw
                     }
             } catch {
