@@ -26,7 +26,7 @@ param(
         }
         return $true
     })]
-    [string]$Version = "2.3",
+    [string]$Version = "2.4",
     [string[]]$RequiredModules = @('GroupPolicy'),
     [string]$CertModule = "PSPKI",
     [string]$Directory = "c:\temp\BRAVE\",
@@ -35,8 +35,89 @@ param(
 )
 $ErrorActionPreference = "SilentlyContinue" # Fail-forward
 
+function Write-Info {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$m,                                                             # Required: -m "."      Message to write
+        [ValidateSet('Info', 'Warn', 'Error', 'Debug', 'Header', 'Status')]     # Required: -lvl        Available levels
+        [string]$lvl = 'Info',                                                  #                       Default -lvl is Info
+        [System.Management.Automation.ErrorRecord]$ex,                          # Optional: -ex $_      Include exception details
+        [string]$show,                                                          # Optional: -show "."   User-facing message (regardless if -m is empty)
+        [switch]$NoLog                                                          # Optional: -NoLog      Skip log write
+    )
+    <#
+    .EXAMPLE
+   
+    Write-Info -m "Hello world"                                                 # Example: Basic log entry
+    Write-Info -m "Executing Get-ADDomain query" -show "Querying Domain"        # Example: Log entry and include different'simple' console output for user
+    
+    ---- start example code ----                                                # Example: Script
+    try {                                                                                  
+      Get-ADDomain                                                                                      
+          try {
+              Get-ADDomain -Specics
+          } catch {
+              Write-Info -m "-Specics failed" -lvl Warn -ex $_                  # Example: Log granular message { -m "-Specics failed" }, include exception details for log output { -ex $_ }
+          } 
+    } catch {                                                              
+        Write-Info -m "Get-ADDomain failed" -lvl Warn -ex $_ -show "Done"       # Example: Log granular message { -m "Get-ADDomain failed }, include include basic user message
+    }                                                                                           
+    ---- end example code ----                                                                        
+    #>
 
-#region HANDLERS
+    $ts = Get-Date -Format 'MMM dd yyyy HH:mm:ss'                               # Generate timestamp
+    $msg = "[$ts] [$lvl] $m"                                                    # Create base message (timestamp, logging level {-lvl Warn}, message {-m "Get-ADDomain..."})
+
+    
+    if (($lvl -eq 'Warn' -or $lvl -eq 'Error') -and $ex) {                      # Exception handling for -lvl Warn and Error, if included { -ex $_  } 
+        $exceptionDetails = @(
+            "   EXCEPTION:",
+            "   Type:", 
+            "   $($ex.Exception.GetType().FullName)",
+            "   Message:", 
+            "   $($ex.Exception.Message)",
+            "   StackTrace:", 
+            "   $($ex.Exception.StackTrace)",
+            "   Line:", 
+            "   $($ex.InvocationInfo.ScriptLineNumber)",
+            "   Position:",
+            "   $($ex.InvocationInfo.PositionMessage)"
+        )
+        $msg += "`n" + ($exceptionDetails -join "`n")
+    }
+                                                                            
+    $ready = $script:Log -and (Test-Path $script:Log)                           # Check log availability
+    if (-not $NoLog -and $ready) {                                              # {-NoLog} parmater was not used and log is available 
+        try {        
+            $msg | Out-File -FilePath $script:Log -Append -Force -Encoding UTF8
+        } catch {                                                               # Output to console if append fails
+            Write-Warning "[!] Write-Info failed: $msg"
+        }
+    } else {                                                                    # Emergency message output for -lvl Warn/Error
+        if ($lvl -eq 'Warn') { Write-Warning $m }                               # if the log is unavailable
+        elseif ($lvl -eq 'Error') { Write-Error $m }
+    }
+
+    if ($show) {                                                                # { -lvl Warn } Log level console formatting 
+        switch ($lvl) {
+            'Info'   { Write-Host $show -ForegroundColor Cyan }
+            'Debug'  { Write-Host $show -ForegroundColor White }
+            'Warn'   { Write-Host "[*] $show" -ForegroundColor Yellow }
+            'Error'  { Write-Host "[!] $show" -ForegroundColor Red }
+            'Header' {
+                Write-Host "`n=================================" -ForegroundColor DarkGray
+                Write-Host $show -ForegroundColor White
+                Write-Host "=================================" -ForegroundColor DarkGray
+            }
+            'Status' {
+                Write-Host "`n$show" -ForegroundColor White
+            }
+        }
+    }
+}
+
+#region             ## HANDLERS ##
 function FormatValue {
     param(
         [Parameter(ValueFromPipeline)]
@@ -55,8 +136,8 @@ function FormatValue {
     }
 }
 
-# Format handler
-$script:FormatValue = {
+
+$script:FormatValue = { # Format handler
     param(
         [Parameter(ValueFromPipeline)]
         $Value
@@ -71,8 +152,7 @@ $script:FormatValue = {
     }
 }
 
-# Recursive lookup handler
-$script:Recursive = {
+$script:Recursive = { # Recursive lookup handler
     param (
         [string]$GroupSID,
         [string]$GroupName,
@@ -167,8 +247,7 @@ $script:Recursive = {
     }
 }
 
-# CSV export handler
-$script:Export = {
+$script:Export = { # CSV export handler
     param (
         [Parameter(Mandatory, ValueFromPipeline)]
         [object[]]$InputObject,
@@ -234,8 +313,7 @@ $script:Export = {
     }
 }
 
-# Archive handler
-$script:Validate = {
+$script:Validate = { # Archive handler
     [CmdletBinding()]
     param (
         [Parameter(Mandatory)]
@@ -243,8 +321,7 @@ $script:Validate = {
     )
     
     try {
-        # Expand zip for integrity check
-        $null = [System.IO.Compression.ZipFile]::OpenRead($Path)
+        $null = [System.IO.Compression.ZipFile]::OpenRead($Path) # Expand zip for integrity check
         return $true
     }
     catch {
@@ -255,99 +332,9 @@ $script:Validate = {
         if ($zip) { $zip.Dispose() }
     }
 }
-#endregion HANDLERS
+#endregion          ## HANDLERS ##
 
-#region ## WRITE ##
-
-function Write-Info {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$m,                                                                         # Required: -m "."      Message to write
-
-        [ValidateSet('Info', 'Warn', 'Error', 'Debug', 'Header', 'Status')]         # Required: -lvl        Available levels
-        [string]$lvl = 'Info',                                                              #                       Info is default -lvl if not specified
-        [System.Management.Automation.ErrorRecord]$ex,                                      # Optional: -ex $_      Include exception details
-        [string]$show,                                                                      # Optional: -show "."   User-facing message (regardless if -m is empty)
-        [switch]$NoLog                                                                      # Optional: -NoLog      Skip log write
-    )
-    <#
-    .EXAMPLE
-   
-    Write-Info -m "Hello world"                                                             # Example: Basic log entry
-    
-    Write-Info -m "Executing Get-ADDomain query" -show "Querying Domain"                    # Example: Log entry and include different'simple' console output for user
-    
-    ---- start example code ----                                                            # Example: Used within script
-
-    try {                                                                                  
-        Get-ADDomain                                                                                      
-            try {
-                Get-ADDomain -SpecicDetails
-            } catch {
-                Write-Info -m "Get-ADDomain -SpecicDetails" -lvl Warn -ex $_                # Example: Log granular message { -m "Get-ADDomain -SpecicDetails failed" } and include exception details { -ex $_ } for log output 
-            } 
-    } catch {                                                              
-        Write-Info -m "Get-ADDomain failed" -lvl Warn -ex $_ -show "Domain Query Failed"    # Example: Log granular message { -m "Get-ADDomain failed }, include exception details { -ex $_ } for log output, and include simple user message
-    }                                                                                           
-    
-    ---- end example code ----                                                                        
-    
-    #>
-
-    $ts = Get-Date -Format 'MMM dd yyyy HH:mm:ss'                           # Generate timestamp
-    $msg = "[$ts] [$lvl] $m"                                                # Create base message (timestamp, logging level {-lvl Warn}, message {-m "Get-ADDomain..."})
-
-    
-    if (($lvl -eq 'Warn' -or $lvl -eq 'Error') -and $ex) {                  # Exception handling for -lvl Warn and Error, if included { -ex $_  } 
-        $exceptionDetails = @(
-            "   EXCEPTION:",
-            "   Type:", 
-            "   $($ex.Exception.GetType().FullName)",
-            "   Message:", 
-            "   $($ex.Exception.Message)",
-            "   StackTrace:", 
-            "   $($ex.Exception.StackTrace)",
-            "   Line:", 
-            "   $($ex.InvocationInfo.ScriptLineNumber)",
-            "   Position:",
-            "   $($ex.InvocationInfo.PositionMessage)"
-        )
-        $msg += "`n" + ($exceptionDetails -join "`n")
-    }
-                                                                            
-    $ready = $script:Log -and (Test-Path $script:Log)                       # Check log availability
-    if (-not $NoLog -and $ready) {                                          # {-NoLog} parmater was not used and log is available 
-        try {        
-            $msg | Out-File -FilePath $script:Log -Append -Force -Encoding UTF8
-        } catch {                                                           # Output console if append fails
-            Write-Warning "[!] Write-Info failed: $msg"
-        }
-    } else {                                                                # Output for -lvl Warn/Error even if log is unavailable
-        if ($lvl -eq 'Warn') { Write-Warning $m }
-        elseif ($lvl -eq 'Error') { Write-Error $m }
-    }
-
-    if ($show) {                                                            # User-facing formatting for varoius -lvl {"Get-ADDomain -SpecicDetails" -lvl Warn} 
-        switch ($lvl) {
-            'Info'   { Write-Host $show -ForegroundColor Cyan }
-            'Debug'  { Write-Host $show -ForegroundColor White }
-            'Warn'   { Write-Host "[*] $show" -ForegroundColor Yellow }
-            'Error'  { Write-Host "[!] $show" -ForegroundColor Red }
-            'Header' {
-                Write-Host "`n=================================" -ForegroundColor DarkGray
-                Write-Host $show -ForegroundColor White
-                Write-Host "=================================" -ForegroundColor DarkGray
-            }
-            'Status' {
-                Write-Host "`n$show" -ForegroundColor White
-            }
-        }
-    }
-}
-
-
-#region ## REQIUREMENTS ##
+#region             ## REQIUREMENTS ##
 # Check PowerShell version
 if ($PSVersionTable.PSVersion.Major -lt 5) {
     Write-Info "PowerShell 5 or higher required. Current version: $($PSVersionTable.PSVersion)"
@@ -359,9 +346,9 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     Write-Info "Script requires elevation. Run PowerShell with 'Run As Administrator'."
     throw
 }
-#endregion ## REQIUREMENTS ##
+#endregion          ## REQIUREMENTS ##
 
-#region ## GET ##
+#region             ## GET ##
 function Get-ActiveDirectory {
     [CmdletBinding()]
     param()
@@ -372,12 +359,12 @@ function Get-ActiveDirectory {
         $controls = [ordered]@{
             'RUNTIME' = {
                 $system = Get-CimInstance -ClassName Win32_ComputerSystem
-                $networkKey = if ($system.PartOfDomain) {'Domain-joined'} else {'Workgroup-joined'}
-                $networkValue = if ($system.PartOfDomain) {$system.Domain} else {$system.Workgroup}
+                $isPartOfDomain = $system.PartOfDomain
 
                 $result = @{
                     'Time ' = FormatValue $script:StartTime -Format Write
                     'Computer' = $env:COMPUTERNAME
+                    $($isPartOfDomain ? 'Domain' : 'Workgroup') = if ($isPartOfDomain) { $system.Domain } else { $system.Workgroup }
                     'User' = [Security.Principal.WindowsIdentity]::GetCurrent().Name
                     'Context' = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
                     'CLR Version' = [System.Runtime.InteropServices.RuntimeInformation]::FrameworkDescription
@@ -1748,8 +1735,9 @@ function Get-CertificateServices {
         Write-Info -m "Certificate Services failed" -lvl Error -ex $_
     }
 }
-#endregion ## GET ##
+#endregion          ## GET ##
 
+#region             ## BRAVE ##
 function Initialize-BRAVE {
     [CmdletBinding()]
     param(
@@ -2206,6 +2194,7 @@ function Start-BRAVE {
                 Write-Progress -Activity "Executing BRAVE Script" -Completed
             }
         }
+#endregion          ## BRAVE ##
 
 # Main script execution block
 Write-Info -m "Main script block"
