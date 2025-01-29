@@ -138,8 +138,8 @@ $script:Format = { # Format handler
         { $_ -is [DateTime] } { 
             $utcTime = $_.ToUniversalTime()
             switch($Format) {
-                'Write' { return $utcTime.ToString('MMM dd, yyyy HH:mm (UTCEE)') }
-                'File'  { return $utcTime.ToString('MMM-dd-yyyy_HHmm') }
+                'Write' { return $utcTime.ToString('dd MMM yyyy HH:mm:ss (UTC)') }
+                'File'  { return $utcTime.ToString('MMM-dd-yyyy_HHmmss') }
             }
         }
         { $_ -is [TimeSpan] } { return $_.TotalDays }
@@ -1283,10 +1283,10 @@ function Get-ActiveDirectory {
                             DistinguishedName,
                             @{ Name = 'OS'; Expression = {$_.OperatingSystem} },
                             @{ Name = 'OSVersion'; Expression = {$_.OperatingSystemVersion} },
-                            @{ Name = 'LastLogonDate'; Expression = {FormatValue $_.LastLogonDate -Format Write} },
+                            @{ Name = 'LastLogonDate'; Expression = {& $script:Format $_.LastLogonDate -Format Write} },
                             @{ Name = 'Status'; Expression = {if ($_.Enabled) {'Enabled'} else {'Disabled'}} },
                             TrustedForDelegation,
-                            @{ Name = 'Created'; Expression = {FormatValue $_.whenCreated -Format Write} }
+                            @{ Name = 'Created'; Expression = {& $script:Format $_.whenCreated -Format Write} }
 
                         # Export detailed computer information
                         $computerInfo | & $script:Export -Name $section
@@ -1448,7 +1448,7 @@ function Get-ActiveDirectory {
        
         $sectionsToProcess = $Controls.Keys
         foreach ($section in $sectionsToProcess) {
-            Write-Info -m "Processing section: $section" -show "$section" -redraw
+            Write-Info -m "Processing section: $section" -show "$($section)"
             
             try {  # Nest each scriptblock in a try/catch
                 $scriptBlock = $Controls[$section]
@@ -1488,7 +1488,7 @@ function Get-CertificateServices {
     [CmdletBinding()]
     param()
     
-    Write-Info -m "Gathering ADCS" -show "GATHERING CERTIFICATE SERVICES" -Type header
+    Write-Info -m "Gathering ADCS" -show "GATHERING CERTIFICATE SERVICES"
     
     # Basic sanity check
     try {
@@ -1507,7 +1507,7 @@ function Get-CertificateServices {
         # Check PSPKI module
         $pspkiStatus = Test-ModuleAvailability -ModuleName $script:CertModule
         if ($pspkiStatus -ne "Ready") {
-            Write-Info -m "PSPKI module not available" -Type Warn -ex $_
+            Write-Info -m "PSPKI module not available" -lvl Warn -ex $_
             
             @{
                 'CAs' = 0
@@ -1517,7 +1517,7 @@ function Get-CertificateServices {
             return
         }
     } catch {
-        Write-Info -m "Error checking Certificate Services" -lvl Warn -ex $_ -show "Error checking Certificate Services" -Type warn
+        Write-Info -m "Error checking Certificate Services" -lvl Warn -ex $_ -show "Error checking Certificate Services"
         
         @{
             'CAs' = 0
@@ -1552,7 +1552,7 @@ function Get-CertificateServices {
         }
 
         $caNames = $cas | Where-Object {$_.Name} | Select-Object -ExpandProperty ComputerName
-        Write-Info -m "Found CAs: $($caNames -join ', ')" -show "Found $($caNames.Count) Certificate Authorities" -Type info
+        Write-Info -m "Found CAs: $($caNames -join ', ')" -show "Found $($caNames.Count) Certificate Authorities"
 
         # Template enumeration
         $templates = certutil -Template | Out-String
@@ -2164,7 +2164,7 @@ function Start-BRAVE {
 
             $summary = @(
                 "STARTED:  $(& $script:Format $script:StartTime -Format Write)"
-                "FINISHED: $(& $script:FormatValue (Get-Date) -Format Write)"
+                "FINISHED: $(& $script:Format (Get-Date) -Format Write)"
                 "DURATION: $durationFormatted"
                 "CREATED:  $script:Archive"
             ) -join "`n"
