@@ -8,7 +8,12 @@
     Author:         Patrick O'Brien
     Date:           January 22, 2024
     Purpose:        Consolidation of 'Trimarc' and 'Composite' scripts with standardized output, naming, time format and error handling.
-    Requirements:   PowerShell v5 (Run as Administrator), GroupPolicy PowerShell module, Remote Server Administration Tools (RSAT)
+    Requirements:   • A fresh PowerShell session, each run
+                    • PowerShell v5+
+                    • Powershell run using 'Run as Administrator'
+                    • PowerShell modules: See '$RequiredModules'.
+                    • Active Direct Certificate Services (ADCS), 
+                      requires PowerShell module: see '$CertModule'
 .EXAMPLE
     PS> C:\temp\BRAVE.ps1
 #>
@@ -20,13 +25,13 @@ param(
             try {
                 New-Item -Path $_ -ItemType Directory -Force | Out-Null
             } catch {
-                Write-Warning "Cannot create directory $_"
+                Write-Error "Can't create $($Directory): $_"
                 return $false
             }
         }
         return $true
     })]
-    [string]$Version = "2.4",
+    [string]$Version = "2.5",
     [string[]]$RequiredModules = @('GroupPolicy'),
     [string]$CertModule = "PSPKI",
     [string]$Directory = "c:\temp\BRAVE\",
@@ -39,19 +44,21 @@ function Write-Info {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [string]$m,                                                             # Required: -m "."      Message to write
-        [ValidateSet('Info', 'Warn', 'Error', 'Debug', 'Header', 'Status')]     # Required: -lvl        Available levels
-        [string]$lvl = 'Info',                                                  #                       Default -lvl is Info
-        [System.Management.Automation.ErrorRecord]$ex,                          # Optional: -ex $_      Include exception details
-        [string]$show,                                                          # Optional: -show "."   User-facing message (regardless if -m is empty)
-        [switch]$NoLog                                                          # Optional: -NoLog      Skip log write
+        [string]$m,                                                                      # Required: -m "."      Message to write
+        [ValidateSet('Info', 'Debug', 'Done', 'Warn', 'Error',  'Header', 'Status')]     # Required: -lvl        Available levels
+        [string]$lvl = 'Info',                                                           #                       If not explict, defaults to Info
+        [System.Management.Automation.ErrorRecord]$ex,                                   # Optional: -ex $_      Include exception details for automatic log output
+        [switch]$NoLog,                                                                  # Optional: -NoLog      Skip log write
+        [string]$show,                                                                   # Optional: -show "."   Show a custom user-facing message
+        [switch]$redraw                                                                  # Optional: -redraw     Overwrite current console line (intended for -show "")
     )
     <#
     .EXAMPLE
    
     Write-Info -m "Hello world"                                                 # Example: Basic log entry
-    Write-Info -m "Executing Get-ADDomain query" -show "Querying Domain"        # Example: Log entry and include different'simple' console output for user
-    
+    Write-Info -m "Executing Get-ADDomain query" -show "Finding Domain"         # Example: Log entry and include different'simple' console output for user
+    Write-Info -m "." -show "Querying Domain" -redraw                           # Example: User user sees "Finding Domain", and is replaced by "Querying Domain"
+
     ---- start example code ----                                                # Example: Script
     try {                                                                                  
       Get-ADDomain                                                                                      
@@ -65,24 +72,17 @@ function Write-Info {
     }                                                                                           
     ---- end example code ----                                                                        
     #>
-
-    $ts = Get-Date -Format 'MMM dd yyyy HH:mm:ss'                               # Generate timestamp
+    $ts = & $script:Format (Get-Date) -Format Write                             # Generate timestamp with stanardized formatting
     $msg = "[$ts] [$lvl] $m"                                                    # Create base message (timestamp, logging level {-lvl Warn}, message {-m "Get-ADDomain..."})
 
-    
     if (($lvl -eq 'Warn' -or $lvl -eq 'Error') -and $ex) {                      # Exception handling for -lvl Warn and Error, if included { -ex $_  } 
         $exceptionDetails = @(
             "   EXCEPTION:",
-            "   Type:", 
-            "   $($ex.Exception.GetType().FullName)",
-            "   Message:", 
-            "   $($ex.Exception.Message)",
-            "   StackTrace:", 
-            "   $($ex.Exception.StackTrace)",
-            "   Line:", 
-            "   $($ex.InvocationInfo.ScriptLineNumber)",
-            "   Position:",
-            "   $($ex.InvocationInfo.PositionMessage)"
+            "   Type:", "$($ex.Exception.GetType().FullName)",
+            "   Message:", "$($ex.Exception.Message)",
+            "   StackTrace:", "$($ex.Exception.StackTrace)",
+            "   Line:", "$($ex.InvocationInfo.ScriptLineNumber)",
+            "   Position:", "$($ex.InvocationInfo.PositionMessage)"
         )
         $msg += "`n" + ($exceptionDetails -join "`n")
     }
@@ -91,18 +91,26 @@ function Write-Info {
     if (-not $NoLog -and $ready) {                                              # {-NoLog} parmater was not used and log is available 
         try {        
             $msg | Out-File -FilePath $script:Log -Append -Force -Encoding UTF8
-        } catch {                                                               # Output to console if append fails
+        } catch {                                                               # Write to console if append fails log 
             Write-Warning "[!] Write-Info failed: $msg"
         }
-    } else {                                                                    # Emergency message output for -lvl Warn/Error
-        if ($lvl -eq 'Warn') { Write-Warning $m }                               # if the log is unavailable
+    } else {                                                                    # Emergency output for -lvl Warn/Error
+        if ($lvl -eq 'Warn') { Write-Warning $m }                               # if log is unavailable
         elseif ($lvl -eq 'Error') { Write-Error $m }
     }
 
-    if ($show) {                                                                # { -lvl Warn } Log level console formatting 
+    if ($show) {
         switch ($lvl) {
-            'Info'   { Write-Host $show -ForegroundColor Cyan }
+            'Info'   { 
+                if ($redraw) {
+                    Write-Host "`r" + (" " * [Console]::WindowWidth) + "`r" -NoNewline
+                    Write-Host $show -ForegroundColor Cyan -NoNewline
+                } else {
+                    Write-Host $show -ForegroundColor Cyan
+                }
+            }
             'Debug'  { Write-Host $show -ForegroundColor White }
+            'Done'   { Write-Host $show -ForegroundColor Green }
             'Warn'   { Write-Host "[*] $show" -ForegroundColor Yellow }
             'Error'  { Write-Host "[!] $show" -ForegroundColor Red }
             'Header' {
@@ -110,43 +118,30 @@ function Write-Info {
                 Write-Host $show -ForegroundColor White
                 Write-Host "=================================" -ForegroundColor DarkGray
             }
-            'Status' {
-                Write-Host "`n$show" -ForegroundColor White
-            }
+            'Status' { Write-Host $show -ForegroundColor White }
         }
     }
 }
 
 #region             ## HANDLERS ##
-function FormatValue {
+$script:Format = { # Format handler
     param(
         [Parameter(ValueFromPipeline)]
-        [nullable[DateTime]]$DateTime = [DateTime]::UtcNow,
+        $Value,
         [ValidateSet('Write', 'File')]
         [string]$Format = 'Write'
-    )
-
-    if ($null -eq $DateTime) { return "Never" }
-    
-    $utcTime = $DateTime.ToUniversalTime()
-    
-    switch($Format) {
-        'Write'   { $utcTime.ToString('MMM dd, yyyy HH:mm (UTC)') }
-        'File'    { $utcTime.ToString('MMM-dd-yyyy_HHmmss') }
-    }
-}
-
-
-$script:FormatValue = { # Format handler
-    param(
-        [Parameter(ValueFromPipeline)]
-        $Value
     )
     
     if ($null -eq $Value) { return '' }
     
     switch ($Value) {
-        { $_ -is [DateTime] } { return FormatValue -DateTime $_ -Format Write }
+        { $_ -is [DateTime] } { 
+            $utcTime = $_.ToUniversalTime()
+            switch($Format) {
+                'Write' { return $utcTime.ToString('MMM dd, yyyy HH:mm (UTCEE)') }
+                'File'  { return $utcTime.ToString('MMM-dd-yyyy_HHmm') }
+            }
+        }
         { $_ -is [TimeSpan] } { return $_.TotalDays }
         default { return $_ }
     }
@@ -211,8 +206,8 @@ $script:Recursive = { # Recursive lookup handler
                     SamAccountName = $user.SamAccountName
                     Group = $GroupName
                     Enabled = $user.Enabled
-                    LastLogonDate = & $script:FormatValue $user.LastLogonDate
-                    PasswordLastSet = & $script:FormatValue $user.PasswordLastSet
+                    LastLogonDate = & $script:Format $user.LastLogonDate
+                    PasswordLastSet = & $script:Format $user.PasswordLastSet
                     SPNs = $user.ServicePrincipalName -join ';'
                     ObjectType = "User"
                     NestedPath = $currentPath
@@ -258,7 +253,7 @@ $script:Export = { # CSV export handler
     )
 
     begin {
-        $summaryData = [ordered]@{}  # Ordered hashtable
+        $summaryData = [ordered]@{}  # Ordered hashtable for CSV
         $detailedData = [System.Collections.ArrayList]@()
     }
 
@@ -266,19 +261,19 @@ $script:Export = { # CSV export handler
         foreach ($item in $InputObject) {
             if ($item -is [hashtable] -or $item -is [System.Collections.Specialized.OrderedDictionary]) {
                 foreach ($key in $item.Keys) {
-                    $summaryData[$key] = & $script:FormatValue $item[$key]
+                    $summaryData[$key] = & $script:Format $item[$key]
                 }
-            } 
+            }
             elseif ($item -is [PSCustomObject] -and $IsSummary) {
                 $item.PSObject.Properties | ForEach-Object {
-                    $summaryData[$_.Name] = & $script:FormatValue $_.Value
+                    $summaryData[$_.Name] = & $script:Format $_.Value
                 }
             }
             else {
                 if ($item -is [PSObject]) {
                     $clonedItem = $item.PSObject.Copy()
                     foreach ($prop in $clonedItem.PSObject.Properties) {
-                        $prop.Value = & $script:FormatValue $prop.Value
+                        $prop.Value = & $script:Format $prop.Value
                     }
                     [void]$detailedData.Add($clonedItem)
                 } else {
@@ -300,15 +295,19 @@ $script:Export = { # CSV export handler
             }
             
             if (Test-Path $summaryPath) { # Append only
-                $summaryObjects | ConvertTo-Csv -NoTypeInformation | Select-Object -Skip 1 | Add-Content -Path $summaryPath
+                $summaryObjects | ConvertTo-Csv -NoTypeInformation | 
+                    Select-Object -Skip 1 | 
+                    Out-File -Append -FilePath $summaryPath -Encoding UTF8
             } else { # First time running, include headers
-                $summaryObjects | ConvertTo-Csv -NoTypeInformation | Set-Content -Path $summaryPath
+                $summaryObjects | ConvertTo-Csv -NoTypeInformation | 
+                    Out-File -FilePath $summaryPath -Encoding UTF8
             }
         }
     
         if ($detailedData.Count -gt 0 -and -not $IsSummary) {
             $detailedPath = Join-Path $script:Directory "$($script:filename)-$Name.csv"
-            $detailedData | Export-Csv -Path $detailedPath -NoTypeInformation
+            $detailedData | ConvertTo-Csv -NoTypeInformation | 
+                Out-File -FilePath $detailedPath -Encoding UTF8
         }
     }
 }
@@ -353,18 +352,18 @@ function Get-ActiveDirectory {
     [CmdletBinding()]
     param()
     
-    Write-Info -m "Starting Get-AtciveDirectory" -lvl Header -show "QUERYING ACTIVE DIRECTORY" 
+    Write-Info -m "Starting Get-AtciveDirectory" -lvl Header -show "GATHERING ACTIVE DIRECTORY" 
 
     try {
-        $controls = [ordered]@{
-            'RUNTIME' = {
+        $Controls = [ordered]@{ # [ordered] maintains the execution order of BRAVE Controls
+            'RUNTIME' = { # Each scriptblock underneath '$Controls' has the [ordered] type constraint enforced by '$wrappedBlock' 
                 $system = Get-CimInstance -ClassName Win32_ComputerSystem
-                $isPartOfDomain = $system.PartOfDomain
+                $domain = if ($system.PartOfDomain) { 'Domain' } else { 'Workgroup' }
 
                 $result = @{
-                    'Time ' = FormatValue $script:StartTime -Format Write
+                    'Time ' = & $script:Format $script:StartTime -Format Write
                     'Computer' = $env:COMPUTERNAME
-                    $($isPartOfDomain ? 'Domain' : 'Workgroup') = if ($isPartOfDomain) { $system.Domain } else { $system.Workgroup }
+                    $domain = if ($system.PartOfDomain) { $system.Domain } else { $system.Workgroup }
                     'User' = [Security.Principal.WindowsIdentity]::GetCurrent().Name
                     'Context' = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
                     'CLR Version' = [System.Runtime.InteropServices.RuntimeInformation]::FrameworkDescription
@@ -435,19 +434,19 @@ function Get-ActiveDirectory {
                     }
 
                     # Collect details
-                    $detailedData.Add([ordered]@{
+                    $detailedData.Add(@{
                         'Type' = $partitionContext
                         'DN' = $partition
-                        'LastBackup' = & $script:FormatValue $backup
+                        'LastBackup' = & $script:Format $backup
                         'Age (day)' = if ($backup) {
                             [math]::Round((New-TimeSpan -Start $backup).TotalDays)
                         } else { "Never" }
                     }) > $null
 
                     # Collect summary data
-                    $summaryData.Add([ordered]@{
+                    $summaryData.Add(@{
                         'Partition' = $partitionContext
-                        'Last Backup' = & $script:FormatValue $backup
+                        'Last Backup' = & $script:Format $backup
                         'Age (day)' = if ($backup) {
                             [math]::Round((New-TimeSpan -Start $backup).TotalDays)
                         } else { "Never" }
@@ -519,9 +518,9 @@ function Get-ActiveDirectory {
                         'SamAccountName' = $administrator.SamAccountName
                         'Name' = $administrator.Name
                         'Enabled' = $administrator.Enabled
-                        'LastLogonDate ' = & $script:FormatValue $administrator.LastLogonDate 
+                        'LastLogonDate ' = & $script:Format $administrator.LastLogonDate 
                         'LogonAge (days)' = [math]::Round((New-TimeSpan -Start $administrator.LastLogonDate -End (Get-Date)).TotalDays)
-                        'PasswordLastSet ' = & $script:FormatValue $administrator.PasswordLastSet
+                        'PasswordLastSet ' = & $script:Format $administrator.PasswordLastSet
                         'PasswordAge (days)' = [math]::Round((New-TimeSpan -Start $administrator.PasswordLastSet -End (Get-Date)).TotalDays)
                     }
                 } else {
@@ -577,8 +576,8 @@ function Get-ActiveDirectory {
                                     SamAccountName = $user2000.SamAccountName
                                     Group = "Pre-Windows 2000 Compatible Access"
                                     Enabled = $user2000.Enabled
-                                    LastLogonDate = & $script:FormatValue $user2000.LastLogonDate
-                                    PasswordLastSet = & $script:FormatValue $user2000.PasswordLastSet
+                                    LastLogonDate = & $script:Format $user2000.LastLogonDate
+                                    PasswordLastSet = & $script:Format $user2000.PasswordLastSet
                                     ObjectType = "User"
                                     NestedPath = ""
                                     DistinguishedName = $user2000.DistinguishedName
@@ -624,8 +623,8 @@ function Get-ActiveDirectory {
                                 SamAccountName = $account
                                 ObjectType = "User"
                                 Enabled = $member.Enabled
-                                LastLogonDate = & $script:FormatValue $member.LastLogonDate
-                                PasswordLastSet = & $script:FormatValue $member.PasswordLastSet
+                                LastLogonDate = & $script:Format $member.LastLogonDate
+                                PasswordLastSet = & $script:Format $member.PasswordLastSet
                             }
                                 
                                 foreach ($group in $script:PrivilegedGroups.Keys) {
@@ -647,17 +646,19 @@ function Get-ActiveDirectory {
                 if ($groups -or $script:PrivilegedUsers) {
                     # Export attempts with individual try/catch
                     try {
-                        $groups | Export-Csv -Path (Join-Path $script:Directory "$($script:filename)-$section-GROUPS.csv") -NoTypeInformation
+                        $groups | ConvertTo-Csv -NoTypeInformation | 
+                            Out-File -FilePath (Join-Path $script:Directory "$($script:filename)-$section-GROUPS.csv") -Encoding UTF8
                     } catch {
                         Write-Info -m "Failed exporting privileged groups" -lvl Error -ex $_
                     }
-
+                
                     try {
-                        $script:PrivilegedUsers | Export-Csv -Path (Join-Path $script:Directory "$($script:filename)-$section-USER_MATRIX.csv") -NoTypeInformation
+                        $script:PrivilegedUsers | ConvertTo-Csv -NoTypeInformation | 
+                            Out-File -FilePath (Join-Path $script:Directory "$($script:filename)-$section-USER_MATRIX.csv") -Encoding UTF8
                     } catch {
                         Write-Info -m "Failed exporting privileged user matrix" -lvl Error -ex $_
                     }
-
+                
                     # Return summary data
                     $summary
                 } else {
@@ -665,7 +666,7 @@ function Get-ActiveDirectory {
                     [PSCustomObject]@{
                         Status = "No privileged accounts found"
                     } | & $script:Export -Name "$section-NONE-FOUND"
-
+                
                     # Return status for summary
                     @{ $section = "No privileged accounts found" }
                 }
@@ -814,15 +815,15 @@ function Get-ActiveDirectory {
 
                         # Export details
                         try {
-                            [ordered]@{
+                            @{
                                 'Name' = $gpo.DisplayName
                                 'Owner' = $gpo.Owner
                                 'Status' = $gpo.GpoStatus
                                 'Linked OUs' = $links -join '; '
                                 'Security Filtering' = $permissions -join '; '
                                 'Description' = $gpo.Description
-                                'CreationTime' = & $script:FormatValue $gpo.CreationTime
-                                'ModificationTime' = & $script:FormatValue $gpo.ModificationTime
+                                'CreationTime' = & $script:Format $gpo.CreationTime
+                                'ModificationTime' = & $script:Format $gpo.ModificationTime
                                 'UserVersion' = $gpo.User.DSVersion
                                 'ComputerVersion' = $gpo.Computer.DSVersion
                                 'WmiFilter' = if ($gpo.WmiFilter) { $gpo.WmiFilter.Name } else { "None" }
@@ -853,7 +854,7 @@ function Get-ActiveDirectory {
                 
                 if ($krbtgt) {
                     @{
-                        'PasswordLastSet' = & $script:FormatValue $krbtgt.PasswordLastSet
+                        'PasswordLastSet' = & $script:Format $krbtgt.PasswordLastSet
                         'Age (day)' = [math]::Round((New-TimeSpan -Start $krbtgt.PasswordLastSet -End (Get-Date)).TotalDays)
                     }
                 } else {
@@ -940,7 +941,7 @@ function Get-ActiveDirectory {
                             "Name", "ObjectClass", "SamAccountName", "Created",
                             "Modified", "Description", "DNSHostName", "Enabled",
                             "MemberOf", "msDS-HostServiceAccount"
-                        )
+                            )
 
                     $gMSA = Get-ADObject -Filter 'ObjectClass -eq "msDS-GroupManagedServiceAccount"' `
                         -Properties @(
@@ -958,8 +959,8 @@ function Get-ActiveDirectory {
                             [PSCustomObject]@{
                                 Name = $_.Name
                                 Type = "sMSA"
-                                'Created ' = FormatValue $_.Created -Format Write
-                                'Modified ' = FormatValue $_.Modified -Format Write
+                                Created = & $script:Format $_.Created -Format Write
+                                Modified = & $script:Format $_.Modified -Format Write
                                 HostName = $_.DNSHostName
                                 Enabled = $_.Enabled
                                 Computers = $hostComputers -join '; '
@@ -975,8 +976,8 @@ function Get-ActiveDirectory {
                             [PSCustomObject]@{
                                 Name = $_.Name
                                 Type = "gMSA"
-                                Created = FormatValue $_.Created -Format Write
-                                Modified = FormatValue $_.Modified -Format Write
+                                Created = & $script:Format $_.Created -Format Write
+                                Modified = & $script:Format $_.Modified -Format Write
                                 HostName = $_.DNSHostName
                                 Enabled = $_.Enabled
                                 Principals = $principals -join '; '
@@ -984,8 +985,7 @@ function Get-ActiveDirectory {
                             } | & $script:Export -Name $section
                         }
                     } else { # No MSAs found
-                        [PSCustomObject]@{
-                        } | & $script:Export -Name "$section-NONE-FOUND"
+                        @{} | & $script:Export -Name "$section-NONE-FOUND"
                     }
 
                     # Generate summary statistics
@@ -1388,7 +1388,7 @@ function Get-ActiveDirectory {
                                         }
                                     } -ArgumentList $reg.Path, $key
 
-                                    [ordered]@{
+                                    @{
                                         'Server' = $dc.Name
                                         'Key' = $key
                                         'Value' = $value
@@ -1396,7 +1396,7 @@ function Get-ActiveDirectory {
 
                                 } catch {
                                     Write-Log -Message "Failed checking registry on $($dc.Name) for $key : $_" -Level WARN
-                                    [ordered]@{
+                                    @{
                                         'Server' = $dc.Name
                                         'Key' = $key
                                         'Value' = "Error: Unable to connect"
@@ -1425,7 +1425,7 @@ function Get-ActiveDirectory {
                                 }
                             }
 
-                            [ordered]@{
+                            @{
                                 'Server' = $dc.Name
                                 'Key' = "LSAAnonymousNameLookup"
                                 'Value' = $lsaValue
@@ -1433,7 +1433,7 @@ function Get-ActiveDirectory {
 
                         } catch {
                             Write-Info "Failed secedit export on $($dc.Name)" -lvl Warn -ex $_
-                            [ordered]@{
+                            @{
                                 'Server' = $dc.Name
                                 'Key' = "LSAAnonymousNameLookup"
                                 'Value' = "Error: Unable to connect"
@@ -1446,16 +1446,23 @@ function Get-ActiveDirectory {
             }
         }    
        
-        $sectionsToProcess = $controls.Keys
+        $sectionsToProcess = $Controls.Keys
         foreach ($section in $sectionsToProcess) {
-            Write-Info -m "Processing section: $section" -show "$section"
+            Write-Info -m "Processing section: $section" -show "$section" -redraw
             
             try {  # Nest each scriptblock in a try/catch
-                $scriptBlock = $controls[$section]
+                $scriptBlock = $Controls[$section]
                 if ($scriptBlock -is [ScriptBlock]) {
-                    $result = & $scriptBlock # Store scriptblock return value
-                    Write-Info -m "$section completed"
-                    $result | & $script:Export -Name $section -IsSummary # Export the result
+                    
+                    $wrappedBlock = { # Wrap scriptblocks
+                        $result = & $scriptBlock
+                        if ($result -is [hashtable] -and $result -isnot [System.Collections.Specialized.OrderedDictionary]) { # Enforce ordered hashtables
+                            [ordered]@{} + $result
+                        } else {
+                            $result
+                        }
+                    }
+                    $result = & $wrappedBlock # Store scriptblock return value
                 } else {
                     Write-Info -m "Error processing: $section" -lvl warn -ex $_
                     @{
@@ -1470,7 +1477,7 @@ function Get-ActiveDirectory {
             }
         }
     
-        Write-Info -m "Get-BRAVE successfully completed"
+        Write-Info -m "Get-BRAVE successfully completed" -lvl Debug -show "COMPLETE"
 
     } catch {
         Write-Info -m "Get-BRAVE Outtermost catch block failed" -lvl Warn -ex $_ - show "Error gathering Active Directory details"
@@ -1746,32 +1753,31 @@ function Initialize-BRAVE {
     Write-Info -m "Delcare core variables"
     Get-Variable script:* | Remove-Variable -Force  # Clear previous run
     $script:StartTime = [System.DateTime]::UtcNow   # Get current time
-    $script:RequiredModules = $RequiredModules                                              # {
-    $script:CertModule = $CertModule                                                        #   from global
-    $script:Version = $Version                                                              #   script param
-    $script:Directory = $Directory                                                          # }
-    $script:filename = $env:COMPUTERNAME                                                    # Start with computer name
-    try {                                                                                   # Filename suffix
+    $script:RequiredModules = $RequiredModules      # {
+    $script:CertModule = $CertModule                #   from global
+    $script:Version = $Version                      #   script param
+    $script:Directory = $Directory                  # }
+    try {                                           # Filename suffix
         $script:ADDomain = Get-ADDomain
-        $script:filename = $script:ADDomain.DNSRoot                                         # Get-ADDomain succeeded
+        $script:filename = $script:ADDomain.DNSRoot # Get-ADDomain succeeded
     } catch {
-        $script:filename = $env:COMPUTERNAME                                                # Get-ADDomain failed
+        $script:filename = $env:COMPUTERNAME        # Get-ADDomain failed
     }
     $script:Log = Join-Path $script:Directory "$($script:filename).log"                     # Establish log file
     $script:Archive = Join-Path (Split-Path $script:Directory) "$($script:filename).zip"    # Establish archive file
     
     # 2. Initalize log file
-
     try {
         if (-not (Test-Path $script:Directory)) {
-            Write-Info -m "$($script:Directory) doesn't exist, creating" -lvl Debug
             New-Item -Path $script:Directory -ItemType Directory -Force | Out-Null
+            Write-Info -m "Created: $($script:Directory)"
         }
         
         "=== BRAVE Assessment Started ===" | Set-Content -Path $script:Log -Force -Encoding UTF8
         Write-Info -m "Initalized $($script:Log)"
     } catch {
         Write-Info "Failed initalizing $($script:Log)" -lvl Error -ex $_
+        return
     }
 
     try {
@@ -1812,12 +1818,15 @@ function Initialize-BRAVE {
 
         try {
             $script:PrivilegedGroups = @{ # Privileged groups for recursive lookups
-            "Enterprise Admins" = "$($script:ADDomain.DomainSID.Value)-519" # Universal scope
-            "Domain Admins"     = "$($script:ADDomain.DomainSID.Value)-512" # Domain scope
-            "Schema Admins"     = "$($script:ADDomain.DomainSID.Value)-518" # Forest scope
-            "*Administrators"    = "S-1-5-32-544"                            # Built-in
-            "Protected Users"   = "$($script:ADDomain.DomainSID.Value)-525" # Security group
-            "Server Operators"   = "$($script:ADDomain.DomainSID.Value)-554" # Security group
+            "Schema Admins"     = "$($script:ADDomain.DomainSID.Value)-518"  # Universal group
+            "Enterprise Admins" = "$($script:ADDomain.DomainSID.Value)-519"  # Universal group
+            "Domain Admins"     = "$($script:ADDomain.DomainSID.Value)-512"  # Global scope
+            "*Administrators"    = "S-1-5-32-544"                            # Built-in group
+            "Protected Users"   = "$($script:ADDomain.DomainSID.Value)-525"  # Global group
+            "*Server Operators"   = "S-1-5-32-549"                           # Built-in group
+            "*Remote Desktop Users" = "S-1-5-32-555"                         # Built-in alias
+            "Pre-Windows 2000" = "S-1-5-32-554"                              # Built-in alias
+            "Hyper-V Administrators" = "S-1-5-32-578"                        # Built-in group
             }
         } catch {
             Write-Info -m "Privileged groups" -lvl Error -ex $_
@@ -1846,8 +1855,7 @@ function Initialize-BRAVE {
      # 5. Broadcast Status
      $summary = @(
         "SCRIPT: v$script:Version"
-        "START:  $(FormatValue $script:StartTime -Format Write)"
-        "FILE:   $($script:Archive)"
+        "START:  $(& $script:Format $script:StartTime -Format Write)"
     ) -join "`n"
 
     $details = @(
@@ -2056,11 +2064,11 @@ function Start-BRAVE {
     )
 
     Write-Info -m "Start-BRAVE running"
-
+    
     try {
         # 1. Discover functions to turn into scriptblocks
         Write-Info -m "Discovering Get-* functions"
-        Write-Info -m "Script Path: $PSCommandPath" -lvl Debug
+        Write-Info -m "Script Path: $($PSCommandPath)" -lvl Debug
 
         $getFunctions = Get-Command -CommandType Function | 
             Where-Object {
@@ -2072,17 +2080,25 @@ function Start-BRAVE {
         $functionNames = $scriptblocks | ForEach-Object { $_.ToString() }
         Write-Info -m "Executing: $($functionNames -join ', ')" -lvl Debug
 
-        # 2. Progress bar
-        $total = $scriptblocks.Count
-        $current = 0
-        Write-Progress -Activity "Executing BRAVE Script" -Completed
-        
+        # 2. Initialize progress bar
+        $progressParams = @{
+            Activity = "Executing BRAVE Assessment"
+            Status = "Starting..."
+            PercentComplete = 0
+        }
+        Write-Progress @progressParams
+
         # 3. Execute scriptblocks
-        foreach ($command in $scriptblocks) {
-            $current++
-            $percentComplete = ($current / $total) * 100
+        $total = $scriptblocks.Count
+        foreach ($i in 0..($total-1)) {
+            $command = $scriptblocks[$i]
+            $percentComplete = ($i / $total) * 100
+            
+            $progressParams.Status = "Running $($command.ToString())"
+            $progressParams.PercentComplete = $percentComplete
+            Write-Progress @progressParams
+
             Write-Info -m "Running: $($command.ToString())" -lvl Debug
-            Write-Progress -Activity "Executing BRAVE" -Status "Running $($command.ToString())" -PercentComplete $percentComplete
 
             try {
                 & $command
@@ -2090,8 +2106,7 @@ function Start-BRAVE {
             catch {
                 Write-Info -m "Failed: $($command.ToString())" -lvl Warn -ex $_
             }
-        } 
-
+        }
 
         #2. Create archive file
         Write-Info -m "Creating archive file" -show "CREATING ARCHIVE FILE" -lvl Header
@@ -2103,7 +2118,7 @@ function Start-BRAVE {
             $itemsToArchive += @(Get-ChildItem -Path $script:Directory -Directory | 
                 Where-Object { $_.FullName -ne $script:GPODirectory })
 
-            Write-Info -m "File Count: $($itemsToArchive.Count)" -lvl Debug
+            Write-Info -m "Archiving $($itemsToArchive.Count) files" -lvl Info
             Write-Info -m "Archiving: $($itemsToArchive.Name -join ', ')" -lvl Debug
 
             if ($itemsToArchive.Count -gt 0) {
@@ -2115,7 +2130,7 @@ function Start-BRAVE {
                         Start-Sleep -Milliseconds 500
                     }
                 } catch {
-                    Write-Info -m "Failed creating zip" -lvl Error -ex $_
+                    Write-Info -m "Failed creating zip" -lvl Warn -ex $_ -show "Failed Creating Archive File"
                 }
             }
 
@@ -2139,61 +2154,60 @@ function Start-BRAVE {
                 Write-Info -m "Failed adding $($PSCommandPath) to $($script:Archive)" -lvl Warn -ex $_
             }
 
-                        # Write summary
-                        $duration = [datetime]::UtcNow - $script:StartTime
-                        $durationFormatted = if ($duration.TotalHours -ge 1) {
-                            $duration.ToString('hh\:mm\:ss')
-                        } else {
-                            $duration.ToString('mm\:ss')
-                        }
+            # Write summary
+            $duration = [datetime]::UtcNow - $script:StartTime
+            $durationFormatted = if ($duration.TotalHours -ge 1) {
+                $duration.ToString('hh\:mm\:ss')
+            } else {
+                $duration.ToString('mm\:ss')
+            }
 
-                        $summary = @(
-                            "STARTED:  $(FormatValue $script:StartTime -Format Write)"
-                            "FINISHED: $(FormatValue ([datetime]::UtcNow) -Format Write)"
-                            "DURATION: $durationFormatted"
-                            "CREATED:  $script:Archive"
-                        ) -join "`n"
+            $summary = @(
+                "STARTED:  $(& $script:Format $script:StartTime -Format Write)"
+                "FINISHED: $(& $script:FormatValue (Get-Date) -Format Write)"
+                "DURATION: $durationFormatted"
+                "CREATED:  $script:Archive"
+            ) -join "`n"
 
-                        Write-Info  "$summary"
-                        Write-Info -m "=== BRAVE Assessment Complete ==="
-                        Start-Sleep -Milliseconds 500
+            Write-Info  "$summary"
+            Write-Info -m "=== BRAVE Assessment Complete ==="
+            Start-Sleep -Milliseconds 500
 
-                        # Add log file
-                        Compress-Archive -Path $script:Log -DestinationPath $script:Archive -Update
-                        Write-Info -m "Added $($script:Log) to $($script:Archive)"
-                        Start-Sleep -Milliseconds 500
+            # Add log file
+            Compress-Archive -Path $script:Log -DestinationPath $script:Archive -Update
+            Write-Info -m "Added $($script:Log) to $($script:Archive)"
+            Start-Sleep -Milliseconds 500
 
-                        # Verify archive and cleanup
-                        if (Test-Path $script:Archive) {
-                            if (& $script:Validate -Path $script:Archive) {
-                                try { # Cleanup
-                                    Get-ChildItem -Path $script:Directory -Exclude (Split-Path $script:Log -Leaf) |
-                                        Remove-Item -Recurse -Force -Confirm:$false
-                                    Remove-Item -Path $script:Log -Force
-                                    Remove-Item -Path $script:Directory -Force
-                                }
-                                catch {
-                                    Write-Info -m "Failed post cleanup" -lvl Error -ex $_
-                                }
-                            }
-                            else {
-                                Write-Info -m "Archive validation failed - skipping cleanup" -lvl Warn -ex $_ -show "Archive not found"
-                            }
-                        }
-                        else {
-                            Write-Info -m "Archive not found - skipping cleanup" -lvl Warn -ex $_ -show "Archive not found"
-                        }
-                    } catch {
-                        Write-Info -m "Error creating archive" -lvl Error -ex $_ -show "Unable to create archive"
-                        throw
+            # Verify archive and cleanup
+            if (Test-Path $script:Archive) {
+                if (& $script:Validate -Path $script:Archive) {
+                    try { # Cleanup
+                        Get-ChildItem -Path $script:Directory -Exclude (Split-Path $script:Log -Leaf) |
+                            Remove-Item -Recurse -Force -Confirm:$false
+                        Remove-Item -Path $script:Log -Force
+                        Remove-Item -Path $script:Directory -Force
                     }
-            } catch {
-                throw
+                    catch {
+                        Write-Info -m "Failed post cleanup" -lvl Error -ex $_
+                    }
+                }
+                else {
+                    Write-Info -m "Archive validation failed - skipping cleanup" -lvl Error -ex $_ -show "Invalid archive"
+                }
             }
-            finally {
-                Write-Progress -Activity "Executing BRAVE Script" -Completed
+            else {
+                Write-Info -m "Archive not found - skipping post-run cleanup" -lvl Warn -ex $_ -show "Archive not found"
             }
+        } catch {
+            Write-Info -m "Error creating archive" -lvl Error -ex $_ -show "Unable to create archive"
         }
+    } catch {
+        Write-Info -m "Start-BRAVE failed" -lvl Warn -ex $_ -show "BRAVE execution failed"
+    }
+    finally {
+        Write-Progress -Activity "Executing BRAVE Script" -Completed
+    }
+}
 #endregion          ## BRAVE ##
 
 # Main script execution block
