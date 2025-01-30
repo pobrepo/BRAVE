@@ -31,8 +31,8 @@ param(
         }
         return $true
     })]
-    [string]$Version = "2.5",
-    [string[]]$RequiredModules = @('GroupPolicy'),
+    [string]$Version = "2.6",
+    [string[]]$RequiredModules = @('ActiveDirectory', 'GroupPolicy'),
     [string]$CertModule = "PSPKI",
     [string]$Directory = "c:\temp\BRAVE\",
     [string]$GPODirectory = (Join-Path $Directory "GPO")
@@ -40,7 +40,7 @@ param(
 )
 $ErrorActionPreference = "SilentlyContinue" # Fail-forward
 
-function Write-Info {
+function LogThis {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
@@ -55,9 +55,9 @@ function Write-Info {
     <#
     .EXAMPLE
    
-    Write-Info -m "Hello world"                                                 # Example: Basic log entry
-    Write-Info -m "Executing Get-ADDomain query" -show "Finding Domain"         # Example: Log entry and include different'simple' console output for user
-    Write-Info -m "." -show "Querying Domain" -redraw                           # Example: User user sees "Finding Domain", and is replaced by "Querying Domain"
+    LogThis -m "Hello world"                                                 # Example: Basic log entry
+    LogThis -m "Executing Get-ADDomain query" -show "Finding Domain"         # Example: Log entry and include different'simple' console output for user
+    LogThis -m "." -show "Querying Domain" -redraw                           # Example: User user sees "Finding Domain", and is replaced by "Querying Domain"
 
     ---- start example code ----                                                # Example: Script
     try {                                                                                  
@@ -65,10 +65,10 @@ function Write-Info {
           try {
               Get-ADDomain -Specics
           } catch {
-              Write-Info -m "-Specics failed" -lvl Warn -ex $_                  # Example: Log granular message { -m "-Specics failed" }, include exception details for log output { -ex $_ }
+              LogThis -m "-Specics failed" -lvl Warn -ex $_                  # Example: Log granular message { -m "-Specics failed" }, include exception details for log output { -ex $_ }
           } 
     } catch {                                                              
-        Write-Info -m "Get-ADDomain failed" -lvl Warn -ex $_ -show "Done"       # Example: Log granular message { -m "Get-ADDomain failed }, include include basic user message
+        LogThis -m "Get-ADDomain failed" -lvl Warn -ex $_ -show "Done"       # Example: Log granular message { -m "Get-ADDomain failed }, include include basic user message
     }                                                                                           
     ---- end example code ----                                                                        
     #>
@@ -92,7 +92,7 @@ function Write-Info {
         try {        
             $msg | Out-File -FilePath $script:Log -Append -Force -Encoding UTF8
         } catch {                                                               # Write to console if append fails log 
-            Write-Warning "[!] Write-Info failed: $msg"
+            Write-Warning "[!] LogThis failed: $msg"
         }
     } else {                                                                    # Emergency output for -lvl Warn/Error
         if ($lvl -eq 'Warn') { Write-Warning $m }                               # if log is unavailable
@@ -123,7 +123,67 @@ function Write-Info {
     }
 }
 
-#region             ## HANDLERS ##
+function GetPrerequisites {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$Verify
+    )
+    
+    LogThis -m "Checking modules: $Verify -join ', ')"
+    $RequiredModules = $Verify.Clone()
+    LogThis -m "Required modules: $($RequiredModules -join ', ')"
+    try {
+        $RSATInstalled = (Get-WindowsFeature -Name RSAT-AD-PowerShell).Installed
+        if ($RSATInstalled) {
+            $RequiredModules = $RequiredModules -notmatch "ActiveDirectory"
+            LogThis -m "RSAT pre-installed; ActiveDirectory removed from list"
+        }
+    } catch {
+        LogThis -m "Unable to verify RSAT " -lvl Warn
+    }
+
+    $ModulesLoaded = Get-Module | Where-Object { $_.Name -in $RequiredModules }
+    LogThis -m "ModulesLoaded1: $($ModulesLoaded.Name -join ', ')"
+    $RequiredModules = $RequiredModules | Where-Object { $_ -notin $ModulesLoaded.Name }
+    
+    if ($ModulesLoaded) {
+        LogThis -m "ModulesLoaded2: $($ModulesLoaded.Name -join ', ')"
+    }
+
+    if ($RequiredModules.Count -gt 0) {
+        LogThis -m "Processing modules: $($RequiredModules -join ', ')" -show "Installing Required Modules"
+        
+        foreach ($Module in $RequiredModules) {
+            if (-not (Get-Module -Name $Module -ListAvailable)) {
+                try {
+                    LogThis -m "$($Module): Installing" -show "$($Module): Installing"
+                    Install-Module -Name $Module -Force -Scope CurrentUser
+                } catch {
+                    LogThis -m "$($Module): Failed" -lvl Warn -ex $_ -show "$($Module): Failed"
+                }
+            }
+            
+            try {
+                LogThis -m "$($Module): Importing" -lvl Done -show "$($Module): Importing"
+                Import-Module -Name $Module -Force
+            } catch {
+                LogThis -m "$($Module): Failed" -lvl Warn -ex $_ "$($Module): Failed"
+            }
+        }
+    }
+
+    $FinalModules = Get-Module | Where-Object { $_.Name -in $Verify }
+    $Missing = $Verify | Where-Object { $_ -notin $FinalModules.Name }
+    
+    if ($Missing.Count -eq 0) {
+        LogThis -m "All modules verified" -lvl Done -show "Prerequisites: Ready"
+    } else {
+        LogThis -m "Missing modules: $($Missing -join ', ')" -lvl Error -show "Prerequisites: Failed"
+    }
+}
+
+#region     ## HIDE ##
 $script:Format = { # Format handler
     param(
         [Parameter(ValueFromPipeline)]
@@ -138,8 +198,8 @@ $script:Format = { # Format handler
         { $_ -is [DateTime] } { 
             $utcTime = $_.ToUniversalTime()
             switch($Format) {
-                'Write' { return $utcTime.ToString('dd MMM yyyy HH:mm:ss (UTC)') }
-                'File'  { return $utcTime.ToString('MMM-dd-yyyy_HHmmss') }
+                'Write' { return $utcTime.ToString('dd MMM yyyy HH:mm (UTC)') }
+                'File'  { return $utcTime.ToString('ddMMMyyyy_HHmmss_UTC') }
             }
         }
         { $_ -is [TimeSpan] } { return $_.TotalDays }
@@ -237,10 +297,12 @@ $script:Recursive = { # Recursive lookup handler
         return $results
     }
     catch {
-        Write-Info -m "Error processing group $($GroupName)" -lvl Warn -ex $_
+        LogThis -m "Error processing group $($GroupName)" -lvl Warn -ex $_
         
     }
 }
+
+$script:SectionCounter = 0
 
 $script:Export = { # CSV export handler
     param (
@@ -253,6 +315,7 @@ $script:Export = { # CSV export handler
     )
 
     begin {
+        $script:SectionCounter++
         $summaryData = [ordered]@{}  # Ordered hashtable for CSV
         $detailedData = [System.Collections.ArrayList]@()
     }
@@ -285,27 +348,30 @@ $script:Export = { # CSV export handler
 
     end {
         if ($summaryData.Count -gt 0 -or $IsSummary) {
-            $summaryPath = Join-Path $script:Directory "$($script:filename)_summary.csv"
-            $summaryObjects = foreach ($key in $summaryData.Keys) {
-                [PSCustomObject]@{
+            $summaryPath = Join-Path $script:Directory "$($script:Filename)_summary.csv"
+            $summaryObjects = [System.Collections.ArrayList]@()
+            foreach ($key in ($summaryData.GetEnumerator() | ForEach-Object { $_.Key })) {
+                [void]$summaryObjects.Add([PSCustomObject]@{
+                    'Order' = $script:SectionCounter
                     'Section' = $Name
                     'Property' = $key
                     'Value' = $summaryData[$key]
-                }
+                })
             }
             
-            if (Test-Path $summaryPath) { # Append only
-                $summaryObjects | ConvertTo-Csv -NoTypeInformation | 
-                    Select-Object -Skip 1 | 
-                    Out-File -Append -FilePath $summaryPath -Encoding UTF8
-            } else { # First time running, include headers
-                $summaryObjects | ConvertTo-Csv -NoTypeInformation | 
-                    Out-File -FilePath $summaryPath -Encoding UTF8
+            if (Test-Path $summaryPath) {
+                # Read existing content, add new entries, sort by Order, then write back
+                $existing = Import-Csv -Path $summaryPath
+                $allEntries = @($existing) + @($summaryObjects)
+                $allEntries | Sort-Object { [int]$_.Order } | 
+                    Export-Csv -Path $summaryPath -NoTypeInformation -Encoding UTF8
+            } else {
+                $summaryObjects | Export-Csv -Path $summaryPath -NoTypeInformation -Encoding UTF8
             }
         }
     
         if ($detailedData.Count -gt 0 -and -not $IsSummary) {
-            $detailedPath = Join-Path $script:Directory "$($script:filename)-$Name.csv"
+            $detailedPath = Join-Path $script:Directory "$($script:Filename)-$Name.csv"
             $detailedData | ConvertTo-Csv -NoTypeInformation | 
                 Out-File -FilePath $detailedPath -Encoding UTF8
         }
@@ -324,46 +390,47 @@ $script:Validate = { # Archive handler
         return $true
     }
     catch {
-        Write-Info -m "Archive validation failed" -lvl Error -ex $_
+        LogThis -m "Archive validation failed" -lvl Error -ex $_
         return $false
     }
     finally {
         if ($zip) { $zip.Dispose() }
     }
 }
-#endregion          ## HANDLERS ##
 
-#region             ## REQIUREMENTS ##
+
 # Check PowerShell version
 if ($PSVersionTable.PSVersion.Major -lt 5) {
-    Write-Info "PowerShell 5 or higher required. Current version: $($PSVersionTable.PSVersion)"
+    LogThis "PowerShell 5 or higher required. Current version: $($PSVersionTable.PSVersion)"
     throw
 }
 
 # Check Run as Administrator
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-Info "Script requires elevation. Run PowerShell with 'Run As Administrator'."
+    LogThis "Script requires elevation. Run PowerShell with 'Run As Administrator'."
     throw
 }
-#endregion          ## REQIUREMENTS ##
 
-#region             ## GET ##
-function Get-ActiveDirectory {
+#endregion  ## HIDE ##
+
+function Get-Controls {
     [CmdletBinding()]
     param()
     
-    Write-Info -m "Starting Get-AtciveDirectory" -lvl Header -show "GATHERING ACTIVE DIRECTORY" 
+    LogThis -m "Starting Get-AtciveDirectory" -lvl Header -show "GATHERING ACTIVE DIRECTORY" 
 
     try {
-        $Controls = [ordered]@{ # [ordered] maintains the execution order of BRAVE Controls
-            'RUNTIME' = { # Each scriptblock underneath '$Controls' has the [ordered] type constraint enforced by '$wrappedBlock' 
-                $system = Get-CimInstance -ClassName Win32_ComputerSystem
-                $domain = if ($system.PartOfDomain) { 'Domain' } else { 'Workgroup' }
+        $Controls = [ordered]@{ # [ordered] maintains the execution order
 
-                $result = @{
-                    'Time ' = & $script:Format $script:StartTime -Format Write
+            'RUNTIME' = {
+                $system = Get-CimInstance -ClassName Win32_ComputerSystem
+                $domainType = if ($system.PartOfDomain) { 'Domain' } else { 'Workgroup' }
+                $domainName = if ($system.PartOfDomain) { $system.Domain } else { $system.Workgroup }
+                @{
+                    'Time' = & $script:Format $script:StartTime -Format Write
                     'Computer' = $env:COMPUTERNAME
-                    $domain = if ($system.PartOfDomain) { $system.Domain } else { $system.Workgroup }
+                    'Domain Type' = $domainType
+                    'Domain Name' = $domainName
                     'User' = [Security.Principal.WindowsIdentity]::GetCurrent().Name
                     'Context' = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
                     'CLR Version' = [System.Runtime.InteropServices.RuntimeInformation]::FrameworkDescription
@@ -378,8 +445,8 @@ function Get-ActiveDirectory {
                     'PowerShell Command' = $MyInvocation.MyCommand.Name
                     'PowerShell Line' = $MyInvocation.Line
                     'Working Directory' = (Get-Location).Path
-                }                
-                $result
+                } | & $script:Export -Name $section -IsSummary                
+                
             }
 
             'FOREST' = {
@@ -390,7 +457,7 @@ function Get-ActiveDirectory {
                     'Domains' = $script:ADForest.Domains.Count
                     'Sites' = $script:ADForest.Sites.Count
                     'GCs' = $script:ADForest.GlobalCatalogs.Count
-                }
+                } | & $script:Export -Name $section -IsSummary 
             }
     
             'DOMAIN' = {
@@ -402,7 +469,7 @@ function Get-ActiveDirectory {
                     'DCs' = $script:ADDomain.ReplicaDirectoryServers.Count
                     'GCs' = ($script:DCs | Where-Object IsGlobalCatalog -eq $true).Count
                     'RODCs' = $script:ADDomain.ReadOnlyReplicaDirectoryServers.Count
-                }
+                } | & $script:Export -Name $section -IsSummary 
             }
 
             'DCs' = {
@@ -416,7 +483,6 @@ function Get-ActiveDirectory {
                 # Get partitions
                 $rootDSE = Get-ADRootDSE -Server $script:ADDomain.PDCEmulator
                 $partitions = $rootDSE.namingContexts
-                $detailedData = [System.Collections.ArrayList]@()
                 $summaryData = [System.Collections.ArrayList]@()
 
                 foreach ($partition in $partitions) {
@@ -433,40 +499,28 @@ function Get-ActiveDirectory {
                         "DC=.*" { "Domain" }
                     }
 
-                    # Collect details
-                    $detailedData.Add(@{
-                        'Type' = $partitionContext
-                        'DN' = $partition
-                        'LastBackup' = & $script:Format $backup
-                        'Age (day)' = if ($backup) {
-                            [math]::Round((New-TimeSpan -Start $backup).TotalDays)
-                        } else { "Never" }
-                    }) > $null
+                    # Calculate age using Format handler for TimeSpan
+                    $age = if ($backup) {
+                        & $script:Format (New-TimeSpan -Start $backup -End $script:StartTime)
+                    } else { "Never" }
 
-                    # Collect summary data
+                    # Format for summary
+                    $backupInfo = if ($backup) {
+                        "$(&$script:Format $backup) ($age days)"
+                    } else {
+                        "Never"
+                    }
+
+                    # Add to summary data
                     $summaryData.Add(@{
-                        'Partition' = $partitionContext
-                        'Last Backup' = & $script:Format $backup
-                        'Age (day)' = if ($backup) {
-                            [math]::Round((New-TimeSpan -Start $backup).TotalDays)
-                        } else { "Never" }
+                        $partitionContext = $backupInfo
                     }) > $null
                 }
 
-                if ($detailedData) {
-                    # Export detailed data
-                    $detailedData | & $script:Export -Name $section
-
-                    # Return summary data for section processing
-                    $summaryData
+                if ($summaryData) {
+                    $summaryData  # Return for summary processing
                 } else {
-                    # Create empty file for uniformity
-                    [PSCustomObject]@{
-                        Status = "No backup data found"
-                    } | & $script:Export -Name "$section-NONE-FOUND"
-
-                    # Return status for summary
-                    @{ $section = "No backup data found" }
+                    @{ 'Status' = "No backup data found" }
                 }
             }
     
@@ -542,13 +596,13 @@ function Get-ActiveDirectory {
                 # Process privileged groups
                 foreach ($group in $script:PrivilegedGroups.GetEnumerator()) {
                     try {
-                        Write-Info -m "Processing: $($group.Key), SID: $($group.Value)" -lvl Debug
+                        LogThis -m "Processing: $($group.Key), SID: $($group.Value)" -lvl Debug
                         
                         $members = & $script:Recursive -GroupSID $group.Value `
                                                      -GroupName $group.Key `
                                                      -SecurityGroup $group.Key `
                                                      -AccessPaths $accessPaths
-                        Write-Info -m "$($group.Key) contains: $($members.Count) members" -lvl Debug
+                        LogThis -m "$($group.Key) contains: $($members.Count) members" -lvl Debug
 
                         if ($members) {
                             $groups += $members
@@ -560,7 +614,7 @@ function Get-ActiveDirectory {
                                 Sort-Object -Unique SamAccountName).Count
                         }
                     } catch {
-                        Write-Info -m "Failed processing: $($group.Key), SID: $($group.Value)" -lvl Debug
+                        LogThis -m "Failed processing: $($group.Key), SID: $($group.Value)" -lvl Debug
                     }
                 }
                 
@@ -606,16 +660,16 @@ function Get-ActiveDirectory {
                 $summary["[Authenticated Users] is Member"] = ($pre2000.SamAccountName -contains "Authenticated Users").ToString()
 
                 } catch {
-                    Write-Info -m "Pre-Windows 2000 failed" -lvl warn -ex $_
+                    LogThis -m "Pre-Windows 2000 failed" -lvl warn -ex $_
                 }
 
                 # Create privileged matrix
                 try {
-                    Write-Info -m "Creating privileged matrix for $($accessPaths.Count) accounts" -lvl Debug
+                    LogThis -m "Creating privileged matrix for $($accessPaths.Count) accounts" -lvl Debug
                     $script:PrivilegedUsers = @()
                     
                     foreach ($account in $accessPaths.Keys | Sort-Object) {
-                        Write-Info -m "Processing: $account" -lvl Debug
+                        LogThis -m "Processing: $account" -lvl Debug
                         $member = $groups | Where-Object SamAccountName -eq $account | Select-Object -First 1
                         
                         if ($member.ObjectType -eq 'User') { 
@@ -640,23 +694,23 @@ function Get-ActiveDirectory {
                         }
                     }
                 } catch {
-                    Write-Info -m "Privileged matrix failed" -lvl Warn -ex $_
+                    LogThis -m "Privileged matrix failed" -lvl Warn -ex $_
                 }
 
                 if ($groups -or $script:PrivilegedUsers) {
                     # Export attempts with individual try/catch
                     try {
                         $groups | ConvertTo-Csv -NoTypeInformation | 
-                            Out-File -FilePath (Join-Path $script:Directory "$($script:filename)-$section-GROUPS.csv") -Encoding UTF8
+                            Out-File -FilePath (Join-Path $script:Directory "$($script:Filename)-$section-GROUPS.csv") -Encoding UTF8
                     } catch {
-                        Write-Info -m "Failed exporting privileged groups" -lvl Error -ex $_
+                        LogThis -m "Failed exporting privileged groups" -lvl Error -ex $_
                     }
                 
                     try {
                         $script:PrivilegedUsers | ConvertTo-Csv -NoTypeInformation | 
-                            Out-File -FilePath (Join-Path $script:Directory "$($script:filename)-$section-USER_MATRIX.csv") -Encoding UTF8
+                            Out-File -FilePath (Join-Path $script:Directory "$($script:Filename)-$section-USER_MATRIX.csv") -Encoding UTF8
                     } catch {
-                        Write-Info -m "Failed exporting privileged user matrix" -lvl Error -ex $_
+                        LogThis -m "Failed exporting privileged user matrix" -lvl Error -ex $_
                     }
                 
                     # Return summary data
@@ -770,15 +824,15 @@ function Get-ActiveDirectory {
                 try {
                     New-Item -Path $script:GPODirectory -ItemType Directory -Force > $null
                 } catch {
-                    Write-Info -m "Failed creating $($script:GPODirectory)" -lvl Warn -ex $_
+                    LogThis -m "Failed creating $($script:GPODirectory)" -lvl Warn -ex $_
                 }
                 
                 # Get GPOs
                 try {
                     $Gpos = Get-GPO -All -Server $script:ADDomain.PDCEmulator
-                    Write-Info -m "GPOs: $($Gpos.Count)"
+                    LogThis -m "GPOs: $($Gpos.Count)"
                 } catch {
-                    Write-Info -m "Failed gathering GPOs" -lvl Warn -ex $_
+                    LogThis -m "Failed gathering GPOs" -lvl Warn -ex $_
                 }
                 
                 if ($Gpos) {
@@ -789,10 +843,10 @@ function Get-ActiveDirectory {
                             if ($null -ne $reports.GPO.Name) {
                                 Get-GPOReport -Name $reports.GPO.Name -ReportType Html -Path (Join-Path $script:GPODirectory "$($reports.GPO.Name).html") -Server $script:ADDomain.PDCEmulator
                                 Get-GPOReport -Name $reports.GPO.Name -ReportType Xml -Path (Join-Path $script:GPODirectory "$($reports.GPO.Name).xml") -Server $script:ADDomain.PDCEmulator
-                                Write-Info -m "Exported $($reports.GPO.Name)"
+                                LogThis -m "Exported $($reports.GPO.Name)"
                             }
                         } catch {
-                            Write-Info -m "Failed exporting $($gpo.DisplayName)" -lvl Warn -ex $_
+                            LogThis -m "Failed exporting $($gpo.DisplayName)" -lvl Warn -ex $_
                         }
                         
                         try { # Security groups applied to
@@ -803,14 +857,14 @@ function Get-ActiveDirectory {
                             } | Sort-Object)
                         } catch {
                             $permissions = @("Error getting permissions")
-                            Write-Info -m "Failed gathering permissions: $($gpo.DisplayName)" -lvl Warn -ex $_
+                            LogThis -m "Failed gathering permissions: $($gpo.DisplayName)" -lvl Warn -ex $_
                         }
                         
                         try { # OUs linked to
                             $links = $gpo.GetReport().LinksTo | ForEach-Object { $_.SOMPath }
                         } catch {
                             $links = @("Error getting links")
-                            Write-Info -m "Error getting linked OUs: $($gpo.DisplayName)" -lvl Warn -ex $_
+                            LogThis -m "Error getting linked OUs: $($gpo.DisplayName)" -lvl Warn -ex $_
                         }
 
                         # Export details
@@ -830,7 +884,7 @@ function Get-ActiveDirectory {
                                 'ID' = $gpo.Id
                             } | & $script:Export -Name $section
                         } catch {
-                            Write-Info -m "Failed exporting: $($gpo.DisplayName) $_" -lvl Error -ex $_
+                            LogThis -m "Failed exporting: $($gpo.DisplayName) $_" -lvl Error -ex $_
                         }
                     }
                     
@@ -1127,7 +1181,7 @@ function Get-ActiveDirectory {
             'SYSVOL' = {
                 try {
                     $results = foreach ($dc in $script:DCs) {
-                        Write-Inf- -m "Processing SYSVOL on $($dc.Name)"
+                        LogThis -m "Processing SYSVOL on $($dc.Name)"
                         
                         try {
                             # Recursively enumerate SYSVOL folders with depth limit
@@ -1155,7 +1209,7 @@ function Get-ActiveDirectory {
                                     }
                             }
                         } catch {
-                            Write-Info -m "Failed to process DC: $($dc.Name)" -lvl Warn -ex $_
+                            LogThis -m "Failed to process DC: $($dc.Name)" -lvl Warn -ex $_
                             continue
                         }
                     }
@@ -1169,7 +1223,7 @@ function Get-ActiveDirectory {
                             'DCs Processed' = ($script:DCs | Measure-Object).Count
                             'Custom Permissions' = ($results | Measure-Object).Count
                         } | & $script:Export -Name $section -IsSummary
-                    } else { # Mo custom permissions found
+                    } else { # No custom permissions found
                         @{
                             'DCs Processed' = ($script:DCs).Count
                             'Custom Permissions' = 0
@@ -1277,35 +1331,16 @@ function Get-ActiveDirectory {
                     ) -Server $script:ADDomain.PDCEmulator
 
                     if ($computers) {
-                        # Process and format computer information
-                        $computerInfo = $computers | Select-Object `
-                            Name,
-                            DistinguishedName,
-                            @{ Name = 'OS'; Expression = {$_.OperatingSystem} },
-                            @{ Name = 'OSVersion'; Expression = {$_.OperatingSystemVersion} },
-                            @{ Name = 'LastLogonDate'; Expression = {& $script:Format $_.LastLogonDate -Format Write} },
-                            @{ Name = 'Status'; Expression = {if ($_.Enabled) {'Enabled'} else {'Disabled'}} },
-                            TrustedForDelegation,
-                            @{ Name = 'Created'; Expression = {& $script:Format $_.whenCreated -Format Write} }
+                       
+                        $computers | & $script:Export -Name $section
 
-                        # Export detailed computer information
-                        $computerInfo | & $script:Export -Name $section
-
-                        # Calculate summary metrics
-                        $total = ($computers | Measure-Object).Count
-                        $disabled = ($computers | Where-Object {-not $_.Enabled} | Measure-Object).Count
-                        $delegated = ($computers | Where-Object {$_.TrustedForDelegation} | Measure-Object).Count
-                        $stale = ($computers | Where-Object {
-                            $_.LastLogonDate -and 
-                            $_.LastLogonDate -lt (Get-Date).AddDays(-90)
-                        } | Measure-Object).Count
 
                         # Export summary information
                         @{
-                            'Total' = $total
-                            'Disabled' = $disabled
-                            'Delegated' = $delegated
-                            'Stale' = $stale
+                            'Total' = ($computers).Count
+                            'Disabled' = ($computers | Where-Object {-not $_.Enabled}).Count
+                            'Delegated' = ($computers | Where-Object {$_.TrustedForDelegation}).Count
+                            'Stale' = ($computers | Where-Object {$_.LastLogonDate -gt (Get-Date).AddDays(-90)}).Count
                         } | & $script:Export -Name $section -IsSummary
                     } else {
                         # Record when no computer objects are found
@@ -1335,7 +1370,7 @@ function Get-ActiveDirectory {
                                 IsSummary = $true
                             }
                         } catch {
-                            Write-Info -m "Spooler checked failed: $($_.Name): $_" -lvl Warn -ex $_
+                            LogThis -m "Spooler checked failed: $($_.Name): $_" -lvl Warn -ex $_
                             [PSCustomObject]@{
                                 DC = $_.Name
                                 Host = $_.HostName
@@ -1371,7 +1406,7 @@ function Get-ActiveDirectory {
                     )
 
                     foreach ($dc in $script:DCs) {
-                        Write-Log -Message "Gathering registry on $($dc.Name)" -Level INFO
+                        LogThis -m "Gathering registry on $($dc.Name)"
                         
                         # Check registry values
                         foreach ($reg in $registryKeys) {
@@ -1395,7 +1430,7 @@ function Get-ActiveDirectory {
                                     } | & $script:Export -Name $section
 
                                 } catch {
-                                    Write-Log -Message "Failed checking registry on $($dc.Name) for $key : $_" -Level WARN
+                                    LogThis -m "Failed checking registry on $($dc.Name) for $key : $_" -Level WARN
                                     @{
                                         'Server' = $dc.Name
                                         'Key' = $key
@@ -1432,7 +1467,7 @@ function Get-ActiveDirectory {
                             } | & $script:Export -Name $section
 
                         } catch {
-                            Write-Info "Failed secedit export on $($dc.Name)" -lvl Warn -ex $_
+                            LogThis "Failed secedit export on $($dc.Name)" -lvl Warn -ex $_
                             @{
                                 'Server' = $dc.Name
                                 'Key' = "LSAAnonymousNameLookup"
@@ -1444,11 +1479,296 @@ function Get-ActiveDirectory {
                     & $script:Error $section "Failed gathering $section"
                 }
             }
-        }    
-       
+            
+            'CERTIFICATES' = {
+                try {
+                    $caCheck = certutil -CA
+                    if ($LASTEXITCODE -eq 0) {
+                        LogThis -m "ADCS found: $($caCheck[0])"
+
+                        # Verify PSPKI module is available
+                        LogThis -m "Verifying PSPKI module" -show "Verifying PSPKI module"
+                        GetPrerequisites -Verify $script:CertModule
+                        
+                        # Process CAs
+                        LogThis -m "Processing CAs" -show "CERTIFICATES"
+                        $cas = Get-CA
+                        if ($cas) {
+                            LogThis -m "CAs found: $($cas.Count)"
+                            $authorities = @(foreach ($ca in $cas) {
+                                LogThis -m "Processing: $($ca.Name), $i of $($cas.Count)"
+                                
+                                $endpointDetails = if ($ca.EnrollmentEndpoints) {
+                                    $ca.EnrollmentEndpoints | ForEach-Object {
+                                        $isHttps = $_.Uri -like "https://*"
+                                        $usesNTLM = $_.Authentication -like "*NTLM*"
+                                        
+                                        "EndpointUri=$($_.Uri); IsHttps=$isHttps; Auth=$($_.Authentication); UsesNTLM=$usesNTLM"
+                                    }
+                                }
+                                $enrollmentEndpoints = if ($endpointDetails) { $endpointDetails -join " | " } else { "None" }
+                                
+                                @{
+                                    Name               = $ca.Name
+                                    DisplayName        = $ca.DisplayName
+                                    ComputerName       = $ca.ComputerName
+                                    Type               = $ca.Type
+                                    IsEnterprise       = $ca.IsEnterprise
+                                    IsRoot             = $ca.IsRoot
+                                    IsAccessible       = $ca.IsAccessible
+                                    RegistryOnline     = $ca.RegistryOnline
+                                    ServiceStatus      = $ca.ServiceStatus
+                                    Ping               = $ca.Ping()
+                                    PingAdmin          = $ca.PingAdmin()
+                                    PingRequest        = $ca.PingRequest()
+                                    SetupStatus        = $ca.SetupStatus
+                                    ConfigString       = $ca.ConfigString
+                                    EnrollmentEndpoints = $enrollmentEndpoints
+                                    EnrollmentPrincipals = ($ca.EnrollmentPrincipals -join ", ")
+                                    DistinguishedName  = $ca.DistinguishedName
+                                    Certificate        = $ca.Certificate
+                                    OS                 = $ca.OperatingSystem
+                                }
+                            
+                            })
+                            $authorities | & $script:Export -Name "$section-AUTHORITY"
+                            LogThis -m "Exported '$section-AUTHORITY'"
+                            @{
+                                'Total' = ($authorities | Measure-Object).Count
+                                'Root' = ($authorities | Where-Object { $_.IsRoot }).Name
+                                'Enterprise' = ($authorities | Where-Object IsEnterprise | Select-Object -ExpandProperty Name -Unique) -join ', ' -replace '^$', 'None found'
+                                'Stand-Alone' = ($authorities | Where-Object { -not $_.IsEnterprise } | Select-Object -ExpandProperty Name -Unique) -join ', ' -replace '^$', 'None found'
+                                'Subordinate' = ($authorities | Where-Object { $_.IsEnterprise -and -not $_.IsRoot } | Select-Object -ExpandProperty Name -Unique) -join ', ' -replace '^$', 'None found'
+                                'Accessible' = ($authorities | Where-Object IsAccessible | Select-Object -ExpandProperty Name -Unique) -join ', ' -replace '^$', 'None found'
+                            } | & $script:Export -Name "$section-AUTHORITY" -IsSummary
+                            LogThis -m "Exported '$section-AUTHORITY'-IsSummary"
+                        } else {
+                            LogThis -m "No CAs found on second attempt" -lvl Warn
+                            @{
+                                'Status' = "No CAs found on second attmpt"
+                            } | & $script:Export -Name "$section-AUTHORITY-NONE-FOUND"
+                        }
+
+                    # Templates
+                        LogThis -m "Processing Certificate Templates" -show "Certificate Templates"
+                        $Templates = Get-CertificateTemplate
+                        if ($Templates) {
+                            LogThis -m "Templates found: $($Templates.Count)"
+                            $LowPrivilegedGroups = "Domain Users|Authenticated Users|Everyone"
+                            
+                            $filteredResults = @(foreach($Template in $Templates) {
+                                LogThis -m "Analyzing: $($Template.Name)"
+                                
+                                $TemplateDACL = Get-ADObject -Identity $Template.DistinguishedName -Properties nTSecurityDescriptor |
+                                    Select-Object -ExpandProperty nTSecurityDescriptor
+                                
+                                $EnrollmentRights = $TemplateDACL.Access | Where-Object {
+                                    ($_.ActiveDirectoryRights -match "ExtendedRight" -or 
+                                    $_.ActiveDirectoryRights -match "GenericAll")
+                                }
+                                
+                                $LowPrivilegedEnrollment = $EnrollmentRights | Where-Object {
+                                    $_.IdentityReference -match $LowPrivilegedGroups
+                                }
+
+                                $TemplateProps = Get-ADObject -Identity $Template.DistinguishedName -Properties * 
+
+                                # Check if template has sensitive capabilities
+                                $SensitiveKeyUsage = @(
+                                    # Has authentication EKUs
+                                    [bool]($TemplateProps.'pKIExtendedKeyUsage' | Where-Object { 
+                                        $_ -in @(
+                                            "1.3.6.1.5.5.7.3.2",    # Client Authentication
+                                            "1.3.6.1.5.2.3.4",      # PKINIT Client Authentication
+                                            "1.3.6.1.4.1.311.20.2.2" # Smart Card Logon
+                                        )
+                                    }),
+                                    # Has dangerous EKUs
+                                    [bool]($TemplateProps.'pKIExtendedKeyUsage' -contains "2.5.29.37.0" -or 
+                                        $null -eq $TemplateProps.'pKIExtendedKeyUsage'),
+                                    # Allows SAN specification
+                                    [bool]($TemplateProps.'msPKI-Certificate-Name-Flag' -band 0x00000001)
+                                ) -contains $true
+
+                                # Check for CA Manager Approval requirement
+                                $CAManagerApproval = [bool]($TemplateProps.'msPKI-Enrollment-Flag' -band 0x02)
+
+                                # Determine risk level
+                                $riskLevel = if ($SensitiveKeyUsage -and $LowPrivilegedEnrollment -and !$CAManagerApproval) {
+                                    "CRITICAL - Authentication keys with broad enrollment, no manager approval"
+                                } elseif ($SensitiveKeyUsage -and $LowPrivilegedEnrollment) {
+                                    "HIGH - Authentication keys with broad enrollment, requires approval"
+                                } elseif ($LowPrivilegedEnrollment) {
+                                    "MEDIUM - Broad enrollment rights"
+                                } elseif ($SensitiveKeyUsage) {
+                                    "LOW - Authentication keys with limited enrollment"
+                                } else {
+                                    "INFO - Limited enrollment scope"
+                                }
+
+                                @{
+                                    'Name' = $Template.Name
+                                    'SensitiveKeyUsage' = $SensitiveKeyUsage
+                                    'LowPrivilegedEnrollment' = [bool]$LowPrivilegedEnrollment
+                                    'CAManagerApproval' = $CAManagerApproval
+                                    'EnrollmentPrincipals' = ($EnrollmentRights | ForEach-Object {
+                                        "$($_.IdentityReference)"
+                                    }) -join '; '
+                                    'EnhancedKeyUsage' = ($TemplateProps.'pKIExtendedKeyUsage' -join '; ')
+                                    'Risk' = $riskLevel
+                                }
+                            })
+                            $filteredResults | & $script:Export -Name "$section-TEMPLATES"
+                            LogThis -m "Exported '$section-TEMPLATES'"
+                            # Generate and export summary
+                            @{
+                                'Total' = ($filteredResults | Measure-Object).Count
+                                'Sensitive' = ($filteredResults | Where-Object { $_.SensitiveKeyUsage }).Count
+                                'Critical' = ($filteredResults | Where-Object { $_.Risk -like "CRITICAL*" }).Count
+                                'High' = ($filteredResults | Where-Object { $_.Risk -like "HIGH*" }).Count
+                                'Medium' = ($filteredResults | Where-Object { $_.Risk -like "MEDIUM*" }).Count
+                                'Low' = ($filteredResults | Where-Object { $_.Risk -like "LOW*" }).Count
+                                'Info' = ($filteredResults | Where-Object { $_.Risk -like "INFO*" }).Count
+                            } | & $script:Export -Name "$section-TEMPLATES" -IsSummary
+                            LogThis -m "Exported '$section-TEMPLATES'-IsSummary"
+                        } else {
+                            @{
+                                'Status' = "No Templates found on second attempt"
+                            } | & $script:Export -Name "$section-TEMPLATES-NONE-FOUND"
+                            
+                            @{
+                                'Status' = "No Templates found" 
+                            } | & $script:Export -Name "$section-TEMPLATES" -IsSummary
+                            LogThis -m "Exported '$section-TEMPLATES'-IsSummary"
+                        }
+
+                    # NTAuth  
+                        LogThis -m "Processing NTAuth Certificates" -show "NTAuth Certificates"
+                        $domain = (Get-ADDomain).DNSRoot
+                        if ($domain) {
+                            $ntAuthPath = "CN=NtAuthCertificates,CN=Public Key Services,CN=Services,CN=Configuration,DC=$($domain -replace '\.',',DC=')"
+                            $ntAuthCertificates = @(Get-ADObject -Filter * -SearchBase $ntAuthPath -Properties * | 
+                                Select-Object CanonicalName, CN, Created, Description, DisplayName, objectClass)
+                            $ntAuthCertificates | & $script:Export -Name "$section-NTAUTH"
+                            LogThis -m "Exported '$section-NTAUTH'"
+                            @{
+                                'Total' = ($ntAuthCertificates).Count
+                            } | & $script:Export -Name "$section-NTAUTH" -IsSummary
+                            LogThis -m "Exported '$section-NTAUTH'-IsSummary"
+                        } else {
+                            @{
+                                'Status' = "No NTAuth Certificates found"
+                            } | & $script:Export -Name "$section-NTAUTH-NONE-FOUND"
+                            LogThis -m "Exported '$section-NTAUTH-NONE-FOUND'"
+                            @{ 
+                                'Status' = "No NTAuth Certificates found" 
+                            } | & $script:Export -Name "$section-NTAUTH" -IsSummary
+                            LogThis -m "Exported '$section-NTAUTH'-IsSummary"
+                        }
+
+                    # Logging
+                        LogThis -m "Processing CA Logging Configuration" -show "CA Logging"
+                        $logging = @(foreach ($ca in $cas) {
+                            LogThis -m "Auditing logging for: $($ca.ComputerName)" -lvl Debug
+
+                            # Category Logging (Success & Failure)
+                            $auditPolicy = try { 
+                                $output = auditpol /get /subcategory:"Certification Services" | Out-String
+                                if ($output -match 'Certification Services\s+(.+)$') {
+                                    $matches[1].Trim()
+                                    LogThis -m "Audit Policy: $($matches[1].Trim())" -lvl Debug
+                                } else {
+                                    "No policy found"
+                                    LogThis -m "No policy found" -lvl Debug
+                                }
+                            } catch { 
+                                "Error: $($_.Exception.Message)"
+                            }
+
+                            # Subcategory Logging (127)
+                            $auditConfig = try {
+                                $output = certutil -getreg CA\AuditFilter | Out-String
+                                if ($output -match 'AuditFilter REG_DWORD = ([\da-fA-F]+)') {
+                                    $value = $matches[1]
+                                    switch ($value) {
+                                        "0" { "No auditing configured" }
+                                        "1" { "Success auditing only" }
+                                        "2" { "Failure auditing only" }
+                                        "3" { "Success and failure auditing" }
+                                        default { "Unknown configuration: $value" }
+                                    }
+                                } else {
+                                    "No configuration found"
+                                }
+                            } catch {
+                                "Error: $($_.Exception.Message)"
+                            }
+
+                            # Subcategory supercedes category (1)
+                            $scePolicy = try { 
+                                $value = Get-ItemPropertyValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'SCENoApplyLegacyAuditPolicy'
+                                if ($null -eq $value) { "Not configured" } else { $value }
+                            } catch {
+                                if ($_.Exception.Message -match "Property SCENoApplyLegacyAuditPolicy does not exist") {
+                                    "Not configured"
+                                } else {
+                                    "Error: $($_.Exception.Message)"
+                                }
+                            }
+
+                            # Result Object
+                            @{
+                                Name = $ca.ComputerName
+                                SCEPolicy = $scePolicy
+                                AuditPolicy = $auditPolicy
+                                AuditConfiguration = $auditConfig
+                                HasSCEPolicy = $scePolicy -notmatch "Error|Not configured"
+                                HasAuditPolicy = $auditPolicy -match "Success|Failure"
+                                HasAuditConfig = $auditConfig -match "Success|Failure"
+                            }
+                        }) 
+                        $logging | & $script:Export -Name "$section-LOGGING"
+                        LogThis -m "Exported '$section-LOGGING'"
+                        @{
+                            'CAs' = ($cas | Measure-Object).Count
+                            'Compliant' = ($logging | Where-Object { 
+                                $_.HasSCEPolicy -and $_.HasAuditPolicy -and $_.HasAuditConfig 
+                            } | Measure-Object).Count
+                            'Compliant SCE' = ($logging | Where-Object HasSCEPolicy | Measure-Object).Count
+                            'Compliant Policy' = ($logging | Where-Object HasAuditPolicy | Measure-Object).Count
+                            'Compliant Config' = ($logging | Where-Object HasAuditConfig | Measure-Object).Count
+                        } | & $script:Export -Name "$section-LOGGING" -IsSummary
+
+                        # Generate detailed audit log
+                        $auditLog = foreach ($ca in $logging) {
+                            "CA: $($ca.Name)"
+                            "SCE Policy: $($ca.SCEPolicy)"
+                            "Audit Policy: $($ca.AuditPolicy)"
+                            "Audit Configuration: $($ca.AuditConfiguration)"
+                            "----------------------------------------"
+                        }
+
+                        # Export audit log
+                        $auditLog | Out-File -FilePath (Join-Path $script:Directory "$($script:Filename)-$section-audit.txt") -Encoding UTF8
+
+                    } else {
+                        LogThis -m "ADCS not found (Exit Code: $LASTEXITCODE)" -lvl Info
+                        @{
+                            'Status' = "ADCS not installed"
+                        } | & $script:Export -Name "$section-NONE-FOUND" -IsSummary
+                    }
+                } catch {
+                    LogThis -m "Certificate processing failed" -lvl Error -ex $_
+                    @{
+                        'Status' = "Error: $($_.Exception.Message)"
+                    } | & $script:Export -Name "$section-ERROR" -IsSummary
+                }
+            }
+        }
+        
         $sectionsToProcess = $Controls.Keys
         foreach ($section in $sectionsToProcess) {
-            Write-Info -m "Processing section: $section" -show "$($section)"
+            LogThis -m "Processing section: $section" -show "$($section)"
             
             try {  # Nest each scriptblock in a try/catch
                 $scriptBlock = $Controls[$section]
@@ -1464,347 +1784,86 @@ function Get-ActiveDirectory {
                     }
                     $result = & $wrappedBlock # Store scriptblock return value
                 } else {
-                    Write-Info -m "Error processing: $section" -lvl warn -ex $_
+                    LogThis -m "Error processing: $section" -lvl warn -ex $_
                     @{
-                        $section = $_.Exception.Message
+                        'Status' = $_.Exception.Message
                     } | & $script:Export -Name $section -IsSummary
                 }
             } catch {
-                Write-Info -m "$section failed" -lvl Warn -ex $_
+                LogThis -m "$section failed" -lvl Warn -ex $_
                 @{
-                    $section = $_.Exception.Message
+                    'Status' = $_.Exception.Message
                 } | & $script:Export -Name $section -IsSummary
             }
         }
     
-        Write-Info -m "Get-BRAVE successfully completed" -lvl Debug -show "COMPLETE"
+        LogThis -m "Controls successfully completed" -lvl Debug -show "COMPLETE"
 
     } catch {
-        Write-Info -m "Get-BRAVE Outtermost catch block failed" -lvl Warn -ex $_ - show "Error gathering Active Directory details"
+        LogThis -m "Get-ActiveDirectory" -lvl Warn -ex $_ - show "Error gathering Active Directory details"
     }
 }
 
-function Get-CertificateServices {
-    [CmdletBinding()]
-    param()
-    
-    Write-Info -m "Gathering ADCS" -show "GATHERING CERTIFICATE SERVICES"
-    
-    # Basic sanity check
-    try {
-        $caCheck = certutil -ping
-        if ($LASTEXITCODE -ne 0) {
-            Write-Info -m "ADCS not found: $LASTEXITCODE" -lvl Debug -show "No Certificate Services"
-            
-            @{
-                'CAs' = 0
-                'Status' = 'None found'
-            } | & $script:Export -Name "ADCS" -IsSummary
-
-            return
-        }
-
-        # Check PSPKI module
-        $pspkiStatus = Test-ModuleAvailability -ModuleName $script:CertModule
-        if ($pspkiStatus -ne "Ready") {
-            Write-Info -m "PSPKI module not available" -lvl Warn -ex $_
-            
-            @{
-                'CAs' = 0
-                'Status' = 'PSPKI module not available'
-            } | & $script:Export -Name "ADCS" -IsSummary
-            
-            return
-        }
-    } catch {
-        Write-Info -m "Error checking Certificate Services" -lvl Warn -ex $_ -show "Error checking Certificate Services"
-        
-        @{
-            'CAs' = 0
-            'Status' = 'Error checking Certificate Services'
-        } | & $script:Export -Name "CertificateServices" -IsSummary
-        
-        return
-    }
-
-    # Define output paths
-    $outputPaths = @{
-        Templates    = Join-Path $script:Directory "$($script:filename)-ADCS-Templates.csv"
-        Enrollment   = Join-Path $script:Directory "$($script:filename)-ADCS-Enrollment.csv"
-        Permissions  = Join-Path $script:Directory "$($script:filename)-ADCS-EnrollmentPermissions.csv"
-        NTAuth       = Join-Path $script:Directory "$($script:filename)-ADCS-NTAuth.csv"
-        Logging      = Join-Path $script:Directory "$($script:filename)-ADCS-Logging.csv"
-    }
-
-    try { # Main CA assessment block
-        Write-Info -m "Initiating CA discovery"
-        $cas = Get-CA -ErrorAction Stop
-        
-        if (-not $cas) {
-            Write-Info -m "No Certificate Authorities found, skipping"
-            
-            @{
-                'CAs' = 0
-                'Status' = 'No CAs found in domain'
-            } | & $script:Export -Name "CertificateServices" -IsSummary
-            
-            return
-        }
-
-        $caNames = $cas | Where-Object {$_.Name} | Select-Object -ExpandProperty ComputerName
-        Write-Info -m "Found CAs: $($caNames -join ', ')" -show "Found $($caNames.Count) Certificate Authorities"
-
-        # Template enumeration
-        $templates = certutil -Template | Out-String
-        
-        Write-Info -m "Processing templates"
-        try {
-            $templates | Export-Csv -Path $outputPaths.Templates -NoTypeInformation -Force
-            Write-Info -m "Template exported to: $($outputPaths.Templates)"
-        } catch {
-            Write-Info -m "Failed exporting templates" -lvl Warn -ex $_
-        }
-    
-        # Template permissions
-        Write-Info -m "Gathering template permissions"
-        $filter = @()
-        $maxEnrollPermissions = 0
-
-        $templates -split "(?=Template\[\d+\]:)" | ForEach-Object {
-            $commonName = ""
-            $friendlyName = ""
-            $enrollPermissions = @()
-            $otherPermissions = @()
-
-            $_ -split "`r?`n" | ForEach-Object {
-                if ($_ -match "TemplatePropCommonName") {
-                    $commonName = ($_ -replace "TemplatePropCommonName\s+=\s+", "").Trim()
-                } elseif ($_ -match "TemplatePropFriendlyName") {
-                    $friendlyName = ($_ -replace "TemplatePropFriendlyName\s+=\s+", "").Trim()
-                } elseif ($_ -match "Allow Enroll") {
-                    $enrollPermissions += ($_ -replace "Allow Enroll\s+", "").Trim()
-                } elseif ($_ -match "Allow FullControl|Allow Write") {
-                    $otherPermissions += $_
-                }
-            }
-
-            if ($enrollPermissions.Count -gt 0) {
-                $maxEnrollPermissions = [math]::Max($maxEnrollPermissions, $enrollPermissions.Count)
-                $row = [PSCustomObject]@{
-                    TemplateCommonName = $commonName
-                    TemplateFriendlyName = $friendlyName
-                    FullControlCount = ($otherPermissions | Where-Object { $_ -match "Allow FullControl" }).Count
-                    WriteCount = ($otherPermissions | Where-Object { $_ -match "Allow Write" }).Count
-                }
-                for ($i = 0; $i -lt $enrollPermissions.Count; $i++) {
-                    $row | Add-Member -NotePropertyName ("EnrollPermission" + ($i + 1)) -NotePropertyValue $enrollPermissions[$i]
-                }
-                $filter += $row
-            }
-        }
-
-        # Enrollment permissions
-        try {
-            $filter | Export-Csv -Path $outputPaths.Permissions -NoTypeInformation -Force
-            Write-Info -m "Enrollment permissions exported: $($outputPaths.Permissions)"
-        } catch {
-            Write-Info -m "Failed exporting enrollment permissions" -lvl Warn -ex $_
-        }
-
-        # CA Templates
-        Write-Info -m "Processing CA template assignments"
-        try {
-            $caTemplatesOutput = certutil -CATemplates | Out-String
-            $caTemplates = @()
-            $caTemplatesOutput -split "`r?`n" | ForEach-Object {
-                if ($_ -match ":\s+(.+?)\s+--") {
-                    $caTemplates += $matches[1].Trim()
-                }
-            }
-            
-            # Export enrollments
-            $caTemplates | Export-Csv -Path $outputPaths.Enrollment -NoTypeInformation -Force
-            Write-Info -m "CA template assignments exported to: $($outputPaths.Enrollment)"
-        } catch {
-           Write-Info -m "Failed processing CA template assignments" -lvl Error -ex $_
-        }
-
-        # NtAuth certificates
-        Write-Info -m "Querying NtAuth certificates"
-        try {
-            $ntAuthPath = "CN=NtAuthCertificates,CN=Public Key Services,CN=Services,CN=Configuration,DC=$($script:ADDomain.DNSRoot -replace '\.',',DC=')"
-            $ntAuthCerts = Get-ADObject -Filter * -SearchBase $ntAuthPath -Properties *
-            
-            $ntAuthCerts | Select-Object CanonicalName, CN, Created, Description, DisplayName, objectClass |
-                Export-Csv -Path $outputPaths.NTAuth -NoTypeInformation -Force
-            Write-Info -m "NtAuth certificates exported to: $($outputPaths.NTAuth)"
-        } catch {
-            Write-Info -m "Failed processing NtAuth certificates" -lvl Warn -ex $_
-        }
-
-        # Audit logging configuration
-        Write-Info -m "Beginning audit configuration analysis"
-        try {
-            $auditResults = foreach ($ca in $cas) {
-                $sceValue = try {
-                    Get-ItemPropertyValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'SCENoApplyLegacyAuditPolicy'
-                } catch {
-                    "Not Configured"
-                }
-
-                $policyValue = try {
-                    (auditpol /get /subcategory:"Certification Services" | Out-String) -replace '(?s).*Certification Services\s+(.+)$', '$1'
-                } catch {
-                    "Error retrieving policy"
-                }
-
-                $configValue = try {
-                    (certutil -getreg CA\AuditFilter | Out-String) -replace '(?s).*AuditFilter REG_DWORD = ([\da-fA-F]+).*', '$1'
-                } catch {
-                    "Error retrieving config"
-                }
-
-                [PSCustomObject]@{
-                    Name = $ca.ComputerName
-                    SCE = $sceValue
-                    Policy = $policyValue
-                    Config = $configValue
-                }
-            }
-
-            $auditResults | Export-Csv -Path $outputPaths.Logging -NoTypeInformation -Force
-            Write-Info -m "Audit configuration exported to: $($outputPaths.Logging)"
-
-            # Templates security
-            $templateAnalysis = $filter | ForEach-Object {
-                $vulnerabilities = @()
-                
-                # Vulnerable enrollment permissions
-                if ($_.PSObject.Properties.Name -match "EnrollPermission\d+" | 
-                    Where-Object { $_.$_ -in @('Everyone', 'Authenticated Users', 'Domain Users') }) {
-                    $vulnerabilities += "Overly permissive enrollment rights"
-                }
-
-                # Vulnerable administrative permissions
-                if ($_.FullControlCount -gt 0) {
-                    $vulnerabilities += "Full Control permissions present"
-                }
-                
-                if ($vulnerabilities) {
-                    [PSCustomObject]@{
-                        TemplateName = $_.TemplateCommonName
-                        Finding = $vulnerabilities -join '; '
-                    }
-                }
-            } | & $script:Export -Name "CertificateServices-Vulnerabilities"
-
-            # Audit logging compliance
-            $auditAnalysis = $auditResults | ForEach-Object {
-                $findings = @()
-                
-                if ($_.SCE -eq 'Not Configured') {
-                    $findings += "Legacy audit policy not disabled"
-                }
-                if ($_.Policy -notmatch 'Success and Failure') {
-                    $findings += "Insufficient audit policy"
-                }
-                if ($_.Config -eq '0' -or $_.Config -eq 'Error retrieving config') {
-                    $findings += "Audit filtering not properly configured"
-                }
-                
-                if ($findings) {
-                    [PSCustomObject]@{
-                        CAName = $_.Name
-                        Finding = $findings -join '; '
-                        RiskLevel = 'Medium'
-                        Impact = 'Potential audit gaps'
-                        Remediation = 'Configure comprehensive auditing'
-                        IsSummary = $true
-                    }
-                }
-            } | & $script:Export -Name "ADCS-AuditFindings"
-
-            # Generate summary
-            @{
-                'CAs' = $cas.Count
-                'Templates' = $filter.Count
-                'Templates_With_Weak_Security' = ($templateAnalysis).Count
-                'CAs_With_Audit_Issues' = ($auditAnalysis).Count
-                'NTAuth_Certificates' = ($ntAuthCerts).Count
-                'Status' = 'Assessment completed'
-            } | & $script:Export -Name "ADCS" -IsSummary
-
-        } catch {
-            Write-Info -m "Failed to process audit configuration" -lvl Error -ex $_
-        }
-
-    } catch {
-        Write-Info -m "Certificate Services failed" -lvl Error -ex $_
-    }
-}
-#endregion          ## GET ##
-
-#region             ## BRAVE ##
-function Initialize-BRAVE {
+function Initialize{
     [CmdletBinding()]
     param(
     )
     # 1. Declare core
-    Write-Info -m "Delcare core variables"
+    LogThis -m "Delcare core variables"
     Get-Variable script:* | Remove-Variable -Force  # Clear previous run
     $script:StartTime = [System.DateTime]::UtcNow   # Get current time
     $script:RequiredModules = $RequiredModules      # {
     $script:CertModule = $CertModule                #   from global
     $script:Version = $Version                      #   script param
     $script:Directory = $Directory                  # }
-    try {                                           # Filename suffix
+    try {
         $script:ADDomain = Get-ADDomain
-        $script:filename = $script:ADDomain.DNSRoot # Get-ADDomain succeeded
+        $script:Filename = "$($script:ADDomain.DNSRoot)_$(& $script:Format (Get-Date) -Format File)" # Get-ADDomain succeeded
     } catch {
-        $script:filename = $env:COMPUTERNAME        # Get-ADDomain failed
+        $script:Filename = "$($env:COMPUTERNAME)_$(& $script:Format (Get-Date) -Format File)"        # Get-ADDomain failed
     }
-    $script:Log = Join-Path $script:Directory "$($script:filename).log"                     # Establish log file
-    $script:Archive = Join-Path (Split-Path $script:Directory) "$($script:filename).zip"    # Establish archive file
+    $script:Log = Join-Path $script:Directory "$($script:Filename).log"                     # Establish log file
+    $script:Archive = Join-Path (Split-Path $script:Directory) "$($script:Filename).zip"    # Establish archive file
     
     # 2. Initalize log file
     try {
         if (-not (Test-Path $script:Directory)) {
             New-Item -Path $script:Directory -ItemType Directory -Force | Out-Null
-            Write-Info -m "Created: $($script:Directory)"
+            LogThis -m "Created: $($script:Directory)"
         }
         
         "=== BRAVE Assessment Started ===" | Set-Content -Path $script:Log -Force -Encoding UTF8
-        Write-Info -m "Initalized $($script:Log)"
+        LogThis -m "Initalized $($script:Log)"
     } catch {
-        Write-Info "Failed initalizing $($script:Log)" -lvl Error -ex $_
+        LogThis "Failed initalizing $($script:Log)" -lvl Error -ex $_
         return
     }
 
     try {
         if (Test-Path $script:Directory) {
-            Get-ChildItem -Path $script:Directory -Exclude "$($script:filename).log" | 
+            Get-ChildItem -Path $script:Directory -Exclude "$($script:Filename).log" | 
                 Remove-Item -Recurse -Force -Confirm:$false
-            Write-Info -m "Cleaned up previous run"
+            LogThis -m "Cleaned up previous run"
         }
         
         New-Item -Path $script:Directory -ItemType Directory -Force | Out-Null
-        Write-Info -m "Created $($script:Directory)"
+        LogThis -m "Created $($script:Directory)"
     } catch {
-        Write-Info -m "Failed creating $($script:Directory)" -lvl Error -ex $_ -show "Failed creating BRAVE directory"
+        LogThis -m "Failed creating $($script:Directory)" -lvl Error -ex $_ -show "Failed creating BRAVE directory"
     }
 
     
     # 3. Inialize Active Directory
-    Write-Info -m "Initializing AD varaibles"
+    LogThis -m "Initializing AD varaibles"
     
     $script:LogonAge = 90 # Stale age thresholds
     $script:PasswordAge = 90 # Stale age thresholds
     try {
         try {
             $script:ADForest = Get-ADForest
-            Write-Info -m "Foret: $($script:ADForest)" -lvl Debug
+            LogThis -m "Foret: $($script:ADForest)" -lvl Debug
         } catch {
-            Write-Info -m "Get-ADForest failed" -lvl Error -ex $_
+            LogThis -m "Get-ADForest failed" -lvl Error -ex $_
         }
             
         try {
@@ -1813,7 +1872,7 @@ function Initialize-BRAVE {
                 OperatingSystem, OperatingSystemVersion, ComputerObjectDN, 
                 IsGlobalCatalog, IsReadOnly, IPv4Address, Site
         } catch {
-            Write-Info -m "Get-ADDomainController failed" -lvl Error -ex $_
+            LogThis -m "Get-ADDomainController failed" -lvl Error -ex $_
         }
 
         try {
@@ -1829,27 +1888,27 @@ function Initialize-BRAVE {
             "Hyper-V Administrators" = "S-1-5-32-578"                        # Built-in group
             }
         } catch {
-            Write-Info -m "Privileged groups" -lvl Error -ex $_
+            LogThis -m "Privileged groups" -lvl Error -ex $_
         }
     } catch {
-        Write-Info -m "Failed AD initalization" -lvl Error -ex $_ -show "Failed initalizing Active Directory"
+        LogThis -m "Failed AD initalization" -lvl Error -ex $_ -show "Failed initalizing Active Directory"
         return $false
     }
     
-    # 4. Initalize user properties to query
+    # 4. Initalize user & computer property lists
     $script:UserProperties = @(
-        'SAMAccountname',   'Enabled',        'Name',
-        'DisplayName',      'LastLogonDate',  'Created',
-        'Modified',         'AccountExpirationDate',
-        'PasswordLastSet',  'PasswordNeverExpires',
-        'PasswordNotRequired', 'PasswordExpired',
-        'CannotChangePassword', 'LastBadPasswordAttempt',
-        'badpwdcount',     'logonWorkStations',
-        'AdminCount',      'UserAccountControl',
-        'DoesNotRequirePreAuth',
-        'msDS-SupportedEncryptionTypes',
-        'DistinguishedName',
-        'CanonicalName',   'ServicePrincipalName'
+        'SAMAccountname', 'Enabled', 'Name','DisplayName', 'LastLogonDate', 'Created',
+        'Modified', 'AccountExpirationDate','PasswordLastSet', 'PasswordNeverExpires',
+        'PasswordNotRequired', 'PasswordExpired','CannotChangePassword',
+        'LastBadPasswordAttempt','badpwdcount', 'logonWorkStations',
+        'AdminCount', 'UserAccountControl','DoesNotRequirePreAuth',
+        'msDS-SupportedEncryptionTypes','DistinguishedName',
+        'CanonicalName', 'ServicePrincipalName'
+    )
+
+    $script:ComputerProperties = @(
+        'Name', 'DistinguishedName', 'OperatingSystem', 'OperatingSystemVersion', 
+        'LastLogonDate', 'Enabled','TrustedForDelegation', 'whenCreated'
     )
 
      # 5. Broadcast Status
@@ -1874,201 +1933,26 @@ function Initialize-BRAVE {
         "DCs:    $($script:DCs.Count)"
     ) -join "`n"
 
-    Write-Info -m "$($details)" -lvl Status -show "$($summary)"
+    LogThis -m "$($details)" -lvl Status -show "$($summary)"
 
-     # 5. Prereqs
-    Write-Info -m "Checking prerequisites" -show "CHECKING PREREQUISITES" -lvl header
-    Write-Info -m "Required modules: $($script:RequiredModules -join ', ')" -lvl Debug
-    function Test-RSATInstallation {
-        param (
-            [bool]$isServer
-        )
-        
-        $rsatStatus = $false
-        try {
-            if ($isServer) {
-                $installCommand = { Install-WindowsFeature -Name RSAT-AD-PowerShell -ErrorAction Stop }
-                try {
-                    $rsat = Get-WindowsFeature RSAT-AD-PowerShell -ErrorAction Stop # ErrorAction Stop
-                    $isInstalled = $rsat.InstallState -eq 'Installed'
-                    Write-Info -m "RSAT Installed on Server"
-                } catch {
-                    $isInstalled = $false
-                    Write-Info -m "Failed checking RSAT on Server" -lvl Warn -ex $_
-                }
-            } else {
-                $installCommand = { Add-WindowsCapability -Name "Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0" -Online -ErrorAction Stop }
-                try {
-                    $rsat = Get-WindowsCapability -Name "Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0" -Online -ErrorAction Stop  # ErrorAction Stop
-                    $isInstalled = $rsat.State -eq 'Installed'
-                    Write-Info -m "RSAT Installed on Workstation"
-                } catch {
-                    $isInstalled = $false
-                    Write-Info -m "Failed checking RSAT on Workstation" -lvl Warn -ex $_
-                }
-            }
+    # 5. Prereqs
+    LogThis -m "Checking prerequisites" -show "CHECKING PREREQUISITES" -lvl header
+    GetPrerequisites -Verify $script:RequiredModules
     
-            if (-not $isInstalled) {
-                Write-Info -m "RSAT not installed, installing" -lvl Warn -show "RSAT: Installing"
-                
-                try {
-                    & $installCommand
-                    $rsatStatus = $true
-                    Write-Info -m "RSAT Installed"
-                } catch {
-                    Write-Info -m "RSAT install failed - continuing with limited functionality" -lvl Warn -ex $_ -show "RSAT: Dailed"
-                }
-            } else {
-                Write-Info -m "RSAT installed" -show "RSAT: Ready"
-                $rsatStatus = $true
-            }
-        } catch {
-            Write-Info -m "RSAT failed, attempting to continue" -lvl Warn -ex $_ -show "RSAT Failed"
-        }
-        return $rsatStatus
-    }
-    
-    function Test-ModuleAvailability {
-        param (
-            [string]$ModuleName
-        )
-        Write-Info -m "Running Test-ModuleAvailability"
-        try {
-            # Check if module is already loaded
-            if (Get-Module -Name $($ModuleName)) {
-                Write-Info -m "Module already loaded: $($ModuleName)"
-                return "Ready"
-            }
-        } catch {
-            Write-Info -m "Error checking modules" -lvl Warn -ex $_
-        }
-            
-        # Check if module is installed
-        if (Get-Module -ListAvailable -Name $ModuleName) {
-            try {
-                Import-Module -Name $ModuleName -Force -Verbose:$false
-                Write-Info -m "Imported: $($ModuleName)"
-                return "Ready"
-            } catch {
-                Write-Info -m "$($ModuleName) import failed. Attempting alternate"
-                # Alternate import method
-                try {
-                    Import-Module -Name (Get-Module -ListAvailable -Name $ModuleName |
-                        Select-Object -First 1).Path -Force -Verbose:$false
-                    return "Ready"
-                } catch {
-                    Write-Info -m "Alternate import failed" -lvl Error -ex $_
-                    return "ImportFailed"
-                }
-            }
-        }
-
-        # Module needs to be installed
-        Write-Info -m "Installing module: $($ModuleName)" -lvl Warn -show "Installing module: $($ModuleName)"
-        # Ensure NuGet is available
-        try {
-            if (-not (Get-PackageProvider -Name NuGet)) {
-                Write-Info -m "Installing NuGet"
-                Install-PackageProvider -Name NuGet -Force -Scope CurrentUser | Out-Null
-            }
-        } catch {
-                Write-Info -m "NuGet failed" -lvl Warn -ex $_
-        }
-
-        try {
-            if (Find-Module -Name $ModuleName -ErrorAction Stop) { # ErrorAction Stop
-                try {
-                    Install-Module -Name $ModuleName -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
-                    Import-Module -Name $ModuleName  -Force -Verbose:$false -ErrorAction Stop
-                    return "Ready"
-                    Write-Info -m "$($ModuleName) installed"
-                } catch {
-                    Write-Info -m "$($ModuleName) failed installing" -lvl Error -ex $_ -show "$($ModuleName) failed installing"
-                    return "InstallFailed"
-                }
-            }
-            return "NotFound"
-        } catch {
-            Write-Info -m "Error finding $($ModuleName)" -lvl Error -ex $_
-            return "NotFound"
-        }
-    }
-        
-    # Check OS and RSAT
-    $rsatInstalled = $false
-    try {
-        $osInfo = Get-CimInstance -ClassName Win32_OperatingSystem
-        $isServer = @(2,3) -contains $osInfo.ProductType
-        $rsatInstalled = Test-RSATInstallation -isServer $isServer
-    } catch {
-        Write-Info -Message "OS detection failed, assuming workstation" -lvl Warn -ex $_
-        $rsatInstalled = Test-RSATInstallation -isServer $false
-    }
-    
-    # Check modules
-    $moduleResults = @{}
-    foreach ($module in $ModuleList) {
-        
-        try {
-            $moduleResults[$module] = Test-ModuleAvailability -ModuleName $module
-            Write-Info -m "Processed $($module)"
-        } catch {
-            Write-Info -m "$($module) failed processing"
-            $moduleResults[$module] = "Error"
-        }
-    }
-    
-    # Log results
-    Write-Info -m "Prerequisites summary:"
-    $moduleResults.GetEnumerator() | ForEach-Object {
-        Write-Info -m "$($_.Key) : $($_.Value)"
-        if ($_.Value -ne "Ready") {
-            Write-Info -m "$($_.Key) : $($_.Value)" -lvl Warn -ex $_
-        }
-    }
-    
-    $moduleSuccess = ($moduleResults.Values | Where-Object { $_ -ne "Ready" }).Count -eq 0 # All modules ready
-    Write-Info -m "Module check success: $moduleSuccess"
-
-    if (-not ($rsatInstalled -and $moduleSuccess)) { # One or more failed
-        $failedComponents = @() # List of failed components
-        
-        if (-not $rsatInstalled) { # RSAT failed
-            $failedComponents += "RSAT"
-            Write-Info -m "RSAT failed" 
-        }
-        
-        if (-not $moduleSuccess) { # One or more modules failed
-            $failedModules = $moduleResults.GetEnumerator() | 
-                Where-Object { $_.Value -ne "Ready" } | 
-                ForEach-Object { $_.Key }
-            $failedComponents += "Modules: $($failedModules -join ', ')"
-            Write-Info -m "Modules failed"
-        }
-        
-        $errorMessage = "Prerequisite Checks Failed: $($failedComponents -join '; ')" # Error message
-        
-        Write-Info -m $errorMessage -lvl Warn
-        
-        throw $errorMessage # Throw error to stop script
-        Write-Info -m "Threw $($errorMessage)"
-    }
-    Write-Info -m "PowerShell: Ready" -show "PowerShell: Ready"
-    return $true # All prerequisites met
 }
 
-function Start-BRAVE {
+function BRAVE {
     [CmdletBinding()]
     param (
         [string[]]$Functions
     )
 
-    Write-Info -m "Start-BRAVE running"
+    LogThis -m "BRAVE running"
     
     try {
         # 1. Discover functions to turn into scriptblocks
-        Write-Info -m "Discovering Get-* functions"
-        Write-Info -m "Script Path: $($PSCommandPath)" -lvl Debug
+        LogThis -m "Discovering Get-* functions"
+        LogThis -m "Script Path: $($PSCommandPath)" -lvl Debug
 
         $getFunctions = Get-Command -CommandType Function | 
             Where-Object {
@@ -2078,7 +1962,7 @@ function Start-BRAVE {
                     
         $scriptblocks = @($getFunctions | ForEach-Object { [scriptblock]::Create($_.Name) })
         $functionNames = $scriptblocks | ForEach-Object { $_.ToString() }
-        Write-Info -m "Executing: $($functionNames -join ', ')" -lvl Debug
+        LogThis -m "Executing: $($functionNames -join ', ')" -lvl Debug
 
         # 2. Initialize progress bar
         $progressParams = @{
@@ -2098,18 +1982,18 @@ function Start-BRAVE {
             $progressParams.PercentComplete = $percentComplete
             Write-Progress @progressParams
 
-            Write-Info -m "Running: $($command.ToString())" -lvl Debug
+            LogThis -m "Running: $($command.ToString())" -lvl Debug
 
             try {
                 & $command
             }
             catch {
-                Write-Info -m "Failed: $($command.ToString())" -lvl Warn -ex $_
+                LogThis -m "Failed: $($command.ToString())" -lvl Warn -ex $_
             }
         }
 
-        #2. Create archive file
-        Write-Info -m "Creating archive file" -show "CREATING ARCHIVE FILE" -lvl Header
+        # 4. Create archive file
+        LogThis -m "Creating archive file" -show "CREATING ARCHIVE FILE" -lvl Header
 
         try {
             # Get all items to archive
@@ -2118,19 +2002,19 @@ function Start-BRAVE {
             $itemsToArchive += @(Get-ChildItem -Path $script:Directory -Directory | 
                 Where-Object { $_.FullName -ne $script:GPODirectory })
 
-            Write-Info -m "Archiving $($itemsToArchive.Count) files" -lvl Info
-            Write-Info -m "Archiving: $($itemsToArchive.Name -join ', ')" -lvl Debug
+            LogThis -m "Archiving $($itemsToArchive.Count) files" -lvl Info
+            LogThis -m "Archiving: $($itemsToArchive.Name -join ', ')" -lvl Debug
 
             if ($itemsToArchive.Count -gt 0) {
                 try {
                     $nonLogFiles = $itemsToArchive | Where-Object { $_.FullName -ne $script:Log }
                     if ($nonLogFiles) {
                         Compress-Archive -Path $nonLogFiles.FullName -DestinationPath $script:Archive -Force
-                        Write-Info -m "Added: $($nonLogFiles.FullName -join ', ')" -lvl Debug
+                        LogThis -m "Added: $($nonLogFiles.FullName -join ', ')" -lvl Debug
                         Start-Sleep -Milliseconds 500
                     }
                 } catch {
-                    Write-Info -m "Failed creating zip" -lvl Warn -ex $_ -show "Failed Creating Archive File"
+                    LogThis -m "Failed creating zip" -lvl Warn -ex $_ -show "Failed Creating Archive File"
                 }
             }
 
@@ -2138,20 +2022,20 @@ function Start-BRAVE {
             if (Test-Path $script:GPODirectory) {
                 try {
                     Compress-Archive -Path $script:GPODirectory -DestinationPath $script:Archive -Update
-                    Write-Info -m "Added $($script:GPODirectory) to $($script:Archive)" -lvl Debug
+                    LogThis -m "Added $($script:GPODirectory) to $($script:Archive)" -lvl Debug
                     Start-Sleep -Milliseconds 500
                 } catch {
-                    Write-Info -m "Failed adding $($script:GPODirectory) to $($script:Archive)" -lvl Warn -ex $_
+                    LogThis -m "Failed adding $($script:GPODirectory) to $($script:Archive)" -lvl Warn -ex $_
                 }
             }
 
             # Add invoked script
             try {
                 Compress-Archive -Path $PSCommandPath -DestinationPath $script:Archive -Update
-                Write-Info -m "Added $($PSCommandPath) to $($script:Archive)" -lvl Debug
+                LogThis -m "Added $($PSCommandPath) to $($script:Archive)" -lvl Debug
                 Start-Sleep -Milliseconds 250
             } catch {
-                Write-Info -m "Failed adding $($PSCommandPath) to $($script:Archive)" -lvl Warn -ex $_
+                LogThis -m "Failed adding $($PSCommandPath) to $($script:Archive)" -lvl Warn -ex $_
             }
 
             # Write summary
@@ -2169,13 +2053,13 @@ function Start-BRAVE {
                 "CREATED:  $script:Archive"
             ) -join "`n"
 
-            Write-Info  "$summary"
-            Write-Info -m "=== BRAVE Assessment Complete ==="
+            LogThis  -m "$summary" -lvl Info -show "$summary"
+            LogThis -m "=== BRAVE Assessment Complete ==="
             Start-Sleep -Milliseconds 500
 
             # Add log file
             Compress-Archive -Path $script:Log -DestinationPath $script:Archive -Update
-            Write-Info -m "Added $($script:Log) to $($script:Archive)"
+            LogThis -m "Added $($script:Log) to $($script:Archive)"
             Start-Sleep -Milliseconds 500
 
             # Verify archive and cleanup
@@ -2188,44 +2072,31 @@ function Start-BRAVE {
                         Remove-Item -Path $script:Directory -Force
                     }
                     catch {
-                        Write-Info -m "Failed post cleanup" -lvl Error -ex $_
+                        LogThis -m "Failed post cleanup" -lvl Error -ex $_
                     }
+                } else {
+                    LogThis -m "Archive validation failed - skipping cleanup" -lvl Error -ex $_ -show "Invalid archive"
                 }
-                else {
-                    Write-Info -m "Archive validation failed - skipping cleanup" -lvl Error -ex $_ -show "Invalid archive"
-                }
-            }
-            else {
-                Write-Info -m "Archive not found - skipping post-run cleanup" -lvl Warn -ex $_ -show "Archive not found"
+            } else {
+                LogThis -m "Archive not found - skipping post-run cleanup" -lvl Warn -ex $_
             }
         } catch {
-            Write-Info -m "Error creating archive" -lvl Error -ex $_ -show "Unable to create archive"
+            LogThis -m "Error creating archive" -lvl Error -ex $_ -show "Unable to create archive"
         }
     } catch {
-        Write-Info -m "Start-BRAVE failed" -lvl Warn -ex $_ -show "BRAVE execution failed"
+        LogThis -m "BRAVE failed" -lvl Warn -ex $_ -show "BRAVE execution failed"
     }
     finally {
         Write-Progress -Activity "Executing BRAVE Script" -Completed
     }
 }
-#endregion          ## BRAVE ##
 
 # Main script execution block
-Write-Info -m "Main script block"
+LogThis -m "Main script block"
 try {
-    Write-Info -m "Initalize-Brave"
-    $initResult = Initialize-BRAVE # Run Initialize
-    
-    if ($null -eq $initResult -or $initResult -eq $false) { # Check return from Initialize
-        Write-Info -m "Initalize-BRAVE failed" -lvl Error -ex $_ -show "BRAVE failed initalizing"
-        return
-    } else {
-        Write-Info -m "Initalized-BRAVE succeeded"
-        Start-BRAVE
-    }
-    Write-Info -m"Script Execution complete"
+    Initialize
+    BRAVE
 } 
 catch {
-    Write-Info -m "Main script block failed" -lvl Error -ex $_ -show "BRAVE failed executing"
-    return
+    LogThis -m "Main script block failed" -lvl Error -ex $_ -show "BRAVE failed executing"
 }
