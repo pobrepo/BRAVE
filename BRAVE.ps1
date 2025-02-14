@@ -6,7 +6,7 @@
     Includes automated evidence collection for Veeam Backup & Replication, as an alternative to screenshots.
 .NOTES
     Author:         Patrick O'Brien
-    Date:           January 22, 2024
+    Date:           January 22, 2025
     Purpose:        Consolidation of 'Trimarc' and 'Composite' scripts with standardized output, naming, time format and error handling.
     Requirements:   • A fresh PowerShell session, each run
                     • PowerShell v5+
@@ -31,7 +31,7 @@ param(
         }
         return $true
     })]
-    [string]$Version = "2.6",
+    [string]$Version = "2.7",
     [string[]]$RequiredModules = @('ActiveDirectory', 'GroupPolicy'),
     [string]$CertModule = "PSPKI",
     [string]$Directory = "c:\temp\BRAVE\",
@@ -72,7 +72,7 @@ function LogThis {
     }                                                                                           
     ---- end example code ----                                                                        
     #>
-    $ts = & $script:Format (Get-Date) -Format Write                             # Generate timestamp with stanardized formatting
+    $ts = & $script:Format (Get-Date) -Format Display                             # Generate timestamp with stanardized formatting
     $msg = "[$ts] [$lvl] $m"                                                    # Create base message (timestamp, logging level {-lvl Warn}, message {-m "Get-ADDomain..."})
 
     if (($lvl -eq 'Warn' -or $lvl -eq 'Error') -and $ex) {                      # Exception handling for -lvl Warn and Error, if included { -ex $_  } 
@@ -184,21 +184,86 @@ function GetPrerequisites {
 }
 
 #region     ## HIDE ##
+$script:Export = {
+    param (
+        [Parameter(Mandatory, ValueFromPipeline)] [object[]]$InputObject,
+        [Parameter(Mandatory)] [string]$Name,
+        [string]$Description = $Name,
+        [switch]$IsSummary
+    )
+    begin {
+        $script:SectionCounter++
+        $summaryObjects = [System.Collections.ArrayList]@()
+        $detailedData = [System.Collections.ArrayList]@()
+    }
+    process {
+        foreach ($item in $InputObject) {
+            if (($item -is [hashtable] -or $item -is [System.Collections.Specialized.OrderedDictionary]) -or 
+                ($item -is [PSCustomObject] -and $IsSummary)) {
+                # Create new ordered dictionary to preserve order
+                $ordered = [ordered]@{}
+                
+                # For hashtables, explicitly add items to preserve order
+                if ($item -is [hashtable]) {
+                    foreach ($key in $item.Keys) {
+                        $ordered[$key] = $item[$key]
+                    }
+                } else {
+                    $ordered = $item
+                }
+                
+                # Process in order
+                foreach ($entry in $ordered.GetEnumerator()) {
+                    [void]$summaryObjects.Add([PSCustomObject]@{
+                        Order = $script:SectionCounter
+                        Section = $Name
+                        Property = if ($entry.Key) { $entry.Key } else { $entry.Name }
+                        Value = & $script:Format $entry.Value
+                    })
+                }
+            }
+            elseif ($item -is [PSObject]) {
+                $clonedItem = [PSCustomObject][ordered]@{}
+                foreach ($prop in $item.PSObject.Properties) {
+                    $clonedItem | Add-Member -MemberType NoteProperty -Name $prop.Name -Value (& $script:Format $prop.Value)
+                }
+                [void]$detailedData.Add($clonedItem)
+            }
+            else { [void]$detailedData.Add($item) }
+        }
+    }
+    end {
+        if ($summaryObjects) {
+            $summaryPath = Join-Path $script:Directory "$($script:Filename)_summary.csv"
+            $allEntries = if (Test-Path $summaryPath) {
+                @(Import-Csv -Path $summaryPath) + @($summaryObjects)
+            } else {
+                $summaryObjects
+            }
+            $allEntries | Sort-Object { [int]$_.Order } |
+                Export-Csv -Path $summaryPath -NoTypeInformation -Encoding UTF8
+        }
+        if ($detailedData -and -not $IsSummary) {
+            $detailedData | Export-Csv -Path (Join-Path $script:Directory "$($script:Filename)-$Name.csv") -NoTypeInformation -Encoding UTF8
+        }
+    }
+}
+
 $script:Format = { # Format handler
     param(
         [Parameter(ValueFromPipeline)]
         $Value,
-        [ValidateSet('Write', 'File')]
+        [ValidateSet('Display', 'File')]
         [string]$Format = 'Write'
     )
-    
+
     if ($null -eq $Value) { return '' }
-    
+
     switch ($Value) {
         { $_ -is [DateTime] } { 
             $utcTime = $_.ToUniversalTime()
             switch($Format) {
-                'Write' { return $utcTime.ToString('dd MMM yyyy HH:mm (UTC)') }
+                'Display' { return $utcTime.ToString('dd MMM yyyy HH:mm (UTC)') }
                 'File'  { return $utcTime.ToString('ddMMMyyyy_HHmmss_UTC') }
             }
         }
@@ -304,76 +369,63 @@ $script:Recursive = { # Recursive lookup handler
 
 $script:SectionCounter = 0
 
-$script:Export = { # CSV export handler
+$script:Export = {
     param (
-        [Parameter(Mandatory, ValueFromPipeline)]
-        [object[]]$InputObject,
-        [Parameter(Mandatory)]
-        [string]$Name,
+        [Parameter(Mandatory, ValueFromPipeline)] [object[]]$InputObject,
+        [Parameter(Mandatory)] [string]$Name,
         [string]$Description = $Name,
         [switch]$IsSummary
     )
-
     begin {
-        $script:SectionCounter++
-        $summaryData = [ordered]@{}  # Ordered hashtable for CSV
-        $detailedData = [System.Collections.ArrayList]@()
+        $script:SectionCounter++                                    # Global counter tracks section processing order
+        $summaryObjects = [System.Collections.ArrayList]@()        # ArrayList maintains insertion order
+        $detailedData = [System.Collections.ArrayList]@()         # ArrayList maintains insertion order
     }
-
     process {
         foreach ($item in $InputObject) {
-            if ($item -is [hashtable] -or $item -is [System.Collections.Specialized.OrderedDictionary]) {
-                foreach ($key in $item.Keys) {
-                    $summaryData[$key] = & $script:Format $item[$key]
+            # Processed ordering of hashtables and PSCustomObjects
+            if (($item -is [hashtable] -or $item -is [System.Collections.Specialized.OrderedDictionary]) -or 
+                ($item -is [PSCustomObject] -and $IsSummary)) {
+                # Force ordered processing by converting regular hashtables to OrderedDictionary
+                $ordered = if ($item -is [hashtable]) { [ordered]@{} + $item } else { $item }  
+                
+                # GetEnumerator() preserves OrderedDictionary's property definition order
+                $ordered.GetEnumerator() | ForEach-Object {         
+                    [void]$summaryObjects.Add([PSCustomObject]@{
+                        Order = $script:SectionCounter              
+                        Section = $Name
+                        Property = if ($_.Key) { $_.Key } else { $_.Name }  
+                        Value = & $script:Format $_.Value
+                    })
                 }
             }
-            elseif ($item -is [PSCustomObject] -and $IsSummary) {
-                $item.PSObject.Properties | ForEach-Object {
-                    $summaryData[$_.Name] = & $script:Format $_.Value
+            elseif ($item -is [PSObject]) {
+                $clonedItem = [PSCustomObject][ordered]@{}
+                foreach ($prop in $item.PSObject.Properties) {
+                    $clonedItem | Add-Member -MemberType NoteProperty -Name $prop.Name -Value (& $script:Format $prop.Value)
                 }
+                [void]$detailedData.Add($clonedItem)
             }
-            else {
-                if ($item -is [PSObject]) {
-                    $clonedItem = $item.PSObject.Copy()
-                    foreach ($prop in $clonedItem.PSObject.Properties) {
-                        $prop.Value = & $script:Format $prop.Value
-                    }
-                    [void]$detailedData.Add($clonedItem)
-                } else {
-                    [void]$detailedData.Add($item)
-                }
-            }
+            else { [void]$detailedData.Add($item) }
         }
     }
-
     end {
-        if ($summaryData.Count -gt 0 -or $IsSummary) {
+        if ($summaryObjects) {
             $summaryPath = Join-Path $script:Directory "$($script:Filename)_summary.csv"
-            $summaryObjects = [System.Collections.ArrayList]@()
-            foreach ($key in ($summaryData.GetEnumerator() | ForEach-Object { $_.Key })) {
-                [void]$summaryObjects.Add([PSCustomObject]@{
-                    'Order' = $script:SectionCounter
-                    'Section' = $Name
-                    'Property' = $key
-                    'Value' = $summaryData[$key]
-                })
-            }
             
-            if (Test-Path $summaryPath) {
-                # Read existing content, add new entries, sort by Order, then write back
-                $existing = Import-Csv -Path $summaryPath
-                $allEntries = @($existing) + @($summaryObjects)
-                $allEntries | Sort-Object { [int]$_.Order } | 
-                    Export-Csv -Path $summaryPath -NoTypeInformation -Encoding UTF8
+            # Maintain existing entries and append new ones
+            $allEntries = if (Test-Path $summaryPath) {
+                @(Import-Csv -Path $summaryPath) + @($summaryObjects)
             } else {
-                $summaryObjects | Export-Csv -Path $summaryPath -NoTypeInformation -Encoding UTF8
+                $summaryObjects
             }
+                
+            # Sort by section order to group related properties together
+            $allEntries | Sort-Object { [int]$_.Order } |          
+                Export-Csv -Path $summaryPath -NoTypeInformation -Encoding UTF8
         }
-    
-        if ($detailedData.Count -gt 0 -and -not $IsSummary) {
-            $detailedPath = Join-Path $script:Directory "$($script:Filename)-$Name.csv"
-            $detailedData | ConvertTo-Csv -NoTypeInformation | 
-                Out-File -FilePath $detailedPath -Encoding UTF8
+        if ($detailedData -and -not $IsSummary) {
+            $detailedData | Export-Csv -Path (Join-Path $script:Directory "$($script:Filename)-$Name.csv") -NoTypeInformation -Encoding UTF8
         }
     }
 }
@@ -427,14 +479,13 @@ function Get-Controls {
                 $domainType = if ($system.PartOfDomain) { 'Domain' } else { 'Workgroup' }
                 $domainName = if ($system.PartOfDomain) { $system.Domain } else { $system.Workgroup }
                 @{
-                    'Time' = & $script:Format $script:StartTime -Format Write
+                    'Time' = & $script:Format $script:StartTime -Format Display
                     'Computer' = $env:COMPUTERNAME
                     'Domain Type' = $domainType
                     'Domain Name' = $domainName
-                    'User' = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-                    'Context' = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-                    'CLR Version' = [System.Runtime.InteropServices.RuntimeInformation]::FrameworkDescription
+                    'Logged-In User' = [Security.Principal.WindowsIdentity]::GetCurrent().Name
                     'OS' = (Get-CimInstance -ClassName Win32_OperatingSystem).Caption
+                    'PowerShell Context' = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
                     'PowerShell Application' = $Host.Name
                     'PowerShell Version' = $PSVersionTable.PSVersion
                     'PowerShell Policy' = Get-ExecutionPolicy
@@ -448,30 +499,29 @@ function Get-Controls {
                 } | & $script:Export -Name $section -IsSummary                
                 
             }
-
+            
             'FOREST' = {
                 @{ 
                     'Name' = $script:ADForest.Name
                     'Mode' = $script:ADForest.ForestMode
                     'RootDomain' = $script:ADForest.RootDomain
-                    'Domains' = $script:ADForest.Domains.Count
-                    'Sites' = $script:ADForest.Sites.Count
-                    'GCs' = $script:ADForest.GlobalCatalogs.Count
+                    'Domains' = ($script:ADForest.Domains | Measure-Object).Count
+                    'Sites' = ($script:ADForest.Sites | Measure-Object).Count
+                    'GCs' = ($script:ADForest.GlobalCatalogs | Measure-Object).Count
                 } | & $script:Export -Name $section -IsSummary 
             }
-    
+            
             'DOMAIN' = {
                 @{ 
                     'DNSRoot' = $script:ADDomain.DNSRoot
                     'NetBIOS' = $script:ADDomain.NetBIOSName
                     'Mode' = $script:ADDomain.DomainMode
                     'SID' = $script:ADDomain.DomainSID.Value
-                    'DCs' = $script:ADDomain.ReplicaDirectoryServers.Count
-                    'GCs' = ($script:DCs | Where-Object IsGlobalCatalog -eq $true).Count
-                    'RODCs' = $script:ADDomain.ReadOnlyReplicaDirectoryServers.Count
+                    'DCs' = ($script:ADDomain.ReplicaDirectoryServers | Measure-Object).Count
+                    'RODCs' = ($script:ADDomain.ReadOnlyReplicaDirectoryServers | Measure-Object).Count
                 } | & $script:Export -Name $section -IsSummary 
             }
-
+            
             'DCs' = {
                 
                 $script:DCs | & $script:Export -Name $section # Export details
@@ -1013,8 +1063,8 @@ function Get-Controls {
                             [PSCustomObject]@{
                                 Name = $_.Name
                                 Type = "sMSA"
-                                Created = & $script:Format $_.Created -Format Write
-                                Modified = & $script:Format $_.Modified -Format Write
+                                Created = & $script:Format $_.Created -Format Display
+                                Modified = & $script:Format $_.Modified -Format Display
                                 HostName = $_.DNSHostName
                                 Enabled = $_.Enabled
                                 Computers = $hostComputers -join '; '
@@ -1030,8 +1080,8 @@ function Get-Controls {
                             [PSCustomObject]@{
                                 Name = $_.Name
                                 Type = "gMSA"
-                                Created = & $script:Format $_.Created -Format Write
-                                Modified = & $script:Format $_.Modified -Format Write
+                                Created = & $script:Format $_.Created -Format Display
+                                Modified = & $script:Format $_.Modified -Format Display
                                 HostName = $_.DNSHostName
                                 Enabled = $_.Enabled
                                 Principals = $principals -join '; '
@@ -1824,7 +1874,7 @@ function Initialize{
     }
     $script:Log = Join-Path $script:Directory "$($script:Filename).log"                     # Establish log file
     $script:Archive = Join-Path (Split-Path $script:Directory) "$($script:Filename).zip"    # Establish archive file
-    
+
     # 2. Initalize log file
     try {
         if (-not (Test-Path $script:Directory)) {
@@ -1914,7 +1964,7 @@ function Initialize{
      # 5. Broadcast Status
      $summary = @(
         "SCRIPT: v$script:Version"
-        "START:  $(& $script:Format $script:StartTime -Format Write)"
+        "START:  $(& $script:Format $script:StartTime -Format Display)"
     ) -join "`n"
 
     $details = @(
@@ -2047,8 +2097,8 @@ function BRAVE {
             }
 
             $summary = @(
-                "STARTED:  $(& $script:Format $script:StartTime -Format Write)"
-                "FINISHED: $(& $script:Format (Get-Date) -Format Write)"
+                "STARTED:  $(& $script:Format $script:StartTime -Format Display)"
+                "FINISHED: $(& $script:Format (Get-Date) -Format Display)"
                 "DURATION: $durationFormatted"
                 "CREATED:  $script:Archive"
             ) -join "`n"
@@ -2068,8 +2118,8 @@ function BRAVE {
                     try { # Cleanup
                         Get-ChildItem -Path $script:Directory -Exclude (Split-Path $script:Log -Leaf) |
                             Remove-Item -Recurse -Force -Confirm:$false
-                        Remove-Item -Path $script:Log -Force
-                        Remove-Item -Path $script:Directory -Force
+                        Remove-Item -Path $script:Log -Force -Confirm:$false
+                        Remove-Item -Path $script:Directory -Force -Confirm:$false
                     }
                     catch {
                         LogThis -m "Failed post cleanup" -lvl Error -ex $_
