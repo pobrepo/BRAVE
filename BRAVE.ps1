@@ -1,24 +1,3 @@
-#region     ## HIDE ##
-<#
-.SYNOPSIS
-    BRAVE Assessment Script
-.DESCRIPTION
-    Active Directory queries for the purpose of a BRAVE assessments.
-    Includes automated evidence collection for Veeam Backup & Replication, as an alternative to screenshots.
-.NOTES
-    Author:         Patrick O'Brien
-    Date:           June 23, 2025
-    Purpose:        Consolidation of 'Trimarc' and 'Composite' scripts with standardized output, naming, time format and error handling.
-    Requirements:   • A fresh PowerShell session, each run
-                    • PowerShell v5+
-                    • Powershell run using 'Run as Administrator'
-                    • PowerShell modules: See '$RequiredModules'.
-                    • Active Direct Certificate Services (ADCS), 
-                      requires PowerShell module: see '$CertModule'
-.EXAMPLE
-    PS> .\BRAVE.ps1
-#>
-
 [CmdletBinding()]
 param(
     [ValidateScript({
@@ -32,13 +11,19 @@ param(
         }
         return $true
     })]
-    [string]$Directory = "c:\temp\BRAVE\"
+    [string]$Directory = "c:\temp\BRAVE\",
+    [switch]$Duo,
+    [switch]$Proxy,
+    [switch]$Dns
 )
 
+$Version = "4.4"
 $ErrorActionPreference = "SilentlyContinue"
 $script:StartTime = Get-Date
-$Version = "2.9"
 $RequiredModules = ('ActiveDirectory', 'GroupPolicy')
+if ($Duo) {
+    $RequiredModules += 'PowerDuo'
+}
 $CertModule = "PSPKI"
 $GPODirectory = (Join-Path $Directory "GPO")
 
@@ -106,25 +91,6 @@ function LogThis {
     }
 }
 
-function Get-BackupTime($pattern) {
-    if ($partitions) {
-        $partition = $partitions | Where-Object { $_ -match $pattern } | Select-Object -First 1
-        if ($partition) {
-            $metadata = Get-ADReplicationAttributeMetadata -Object $partition -Properties dSASignature -Server $script:ADDomain.PDCEmulator
-            $backup = $metadata.LastOriginatingChangeTime
-            if ($backup) {
-                $timeSpan = New-TimeSpan -Start $backup -End $script:StartTime
-                $years = [math]::Floor($timeSpan.TotalDays / 365)
-                $months = [math]::Floor(($timeSpan.TotalDays % 365) / 30)
-                $days = [math]::Floor($timeSpan.TotalDays % 30)
-                
-                "$(Get-Date $backup -Format 'dd MMM yyyy') [${years}y:${months}m:${days}d]"
-            }
-        }
-    }
-    return $null
-}
-
 function Format-PartitionBackup {
     param($output)
     if ($output -match '\(LastBackup\) (.*?), \(Elapsed\) (\d+)y:(\d+)m:(\d+)d') {
@@ -169,20 +135,47 @@ function GetPrerequisites {
         LogThis -m "Processing modules: $($RequiredModules -join ', ')" -show "Installing Required Modules"
         
         foreach ($Module in $RequiredModules) {
-            if (-not (Get-Module -Name $Module -ListAvailable)) {
+            $ModuleAvailable = Get-Module -Name $Module -ListAvailable
+            if (-not $ModuleAvailable) {
                 try {
-                    LogThis -m "$($Module): Installing" -show "$($Module): Installing"
+                    LogThis -m "Installing: $Module" -show "Installing: $Module"
                     Install-Module -Name $Module -Force -Scope CurrentUser
+                    LogThis -m "$($Module): Install successful" -lvl Done
                 } catch {
-                    LogThis -m "$($Module): Failed" -lvl Warn -ex $_ -show "$($Module): Failed"
+                    LogThis -m "$($Module): Install failed - $($_.Exception.Message)" -lvl Error -show "$($Module): Failed"
+                    continue
                 }
+            } else {
+                LogThis -m "$($Module): Already available" -lvl Done
             }
             
-            try {
-                LogThis -m "$($Module): Importing" -lvl Done -show "$($Module): Importing"
-                Import-Module -Name $Module -Force
-            } catch {
-                LogThis -m "$($Module): Failed" -lvl Warn -ex $_ "$($Module): Failed"
+            $ImportSuccess = $false
+            $RetryCount = 0
+            $MaxRetries = 3
+            
+            while (-not $ImportSuccess -and $RetryCount -lt $MaxRetries) {
+                try {
+                    LogThis -m "Importing: $Module (attempt $($RetryCount + 1))" -show "Importing: $Module"
+                    Import-Module -Name $Module -Force
+                    
+                    Start-Sleep -Milliseconds 500
+                    
+                    $ImportedModule = Get-Module -Name $Module
+                    if ($ImportedModule) {
+                        LogThis -m "$($Module): Import successful" -lvl Done
+                        $ImportSuccess = $true
+                    } else {
+                        throw "Module not found after import"
+                    }
+                } catch {
+                    $RetryCount++
+                    LogThis -m "$($Module): Import attempt $RetryCount failed - $($_.Exception.Message)" -lvl Warn
+                    if ($RetryCount -lt $MaxRetries) {
+                        Start-Sleep -Seconds 1
+                    } else {
+                        LogThis -m "$($Module): All import attempts failed" -lvl Error -show "$($Module): Failed"
+                    }
+                }
             }
         }
     }
@@ -191,7 +184,8 @@ function GetPrerequisites {
     $Missing = $Verify | Where-Object { $_ -notin $FinalModules.Name }
     
     if ($Missing.Count -eq 0) {
-        LogThis -m "All modules verified" -lvl Done -show "Prerequisites: Ready"
+        LogThis -m "All modules verified" -show "MODULES VERIFIED"
+        LogThis -m "All modules verified" -lvl Done -show "`nCOMPLETED"
     } else {
         LogThis -m "Missing modules: $($Missing -join ', ')" -lvl Error -show "Prerequisites: Failed"
     }
@@ -204,11 +198,12 @@ $script:Export = {
         [Parameter(Mandatory)]
         [string]$Name,
         [string]$Description = $Name,
-        [switch]$IsSummary
+        [switch]$IsSummary,
+        [switch]$NoResults,
+        [switch]$IsError
     )
     begin {
         if (-not $script:ProcessedSections.Contains($Name)) {
-            $script:SectionCounter++
             $script:ProcessedSections.Add($Name) | Out-Null
         }
         $currentOrder = $script:SectionCounter
@@ -252,7 +247,7 @@ $script:Export = {
     }
     end {
         if ($summaryObjects) {
-            $summaryPath = Join-Path $script:Directory "$($script:Filename)_summary.csv"
+            $summaryPath = Join-Path $script:Directory "summary-$($script:Filename).csv"
             $allEntries = if (Test-Path $summaryPath) {
                 @(Import-Csv -Path $summaryPath) + @($summaryObjects)
             } else {
@@ -260,28 +255,29 @@ $script:Export = {
             }
             $allEntries | Sort-Object { [int]$_.Order } |
                 Export-Csv -Path $summaryPath -NoTypeInformation -Encoding UTF8
+            $script:SummarySections += $summaryPath
         }
-        if ($detailedData -and -not $IsSummary) {
-            $detailedData | Export-Csv -Path (Join-Path $script:Directory "$($script:Filename)-$Name.csv") -NoTypeInformation -Encoding UTF8
+        if (-not $IsSummary) {
+            $suffix = if ($IsError) { "-ERROR" } elseif ($NoResults) { "-NORESULTS" } else { "" }
+            $detailPath = Join-Path $script:Directory "$Name-$($script:Filename)$suffix.csv"
+            if ($detailedData) {
+                $detailedData | Export-Csv -Path $detailPath -NoTypeInformation -Encoding UTF8
+            } else {
+                "" | Out-File -FilePath $detailPath -Encoding UTF8  # Create empty file
+            }
+            $script:ExportedFiles += $detailPath
+        }
+        if ($script:ExportedFiles.Count) {
+            LogThis -m "File exported: $($script:ExportedFiles -join ', ')" -lvl Info
+            $script:ExportedFiles = @()
+        }
+        if ($script:SummarySections.Count) {
+            LogThis -m "Summary exported: $($script:SummarySections -join ', ')" -lvl Info
+            $script:SummarySections = @()
         }
     }
 }
 
-$script:ExportRaw = {
-    param (
-        [Parameter(Mandatory, ValueFromPipeline)]
-        [object[]]$InputObject
-    )
-    process {
-        $items = @($InputObject)
-        $name = $section
-        $file = Join-Path $script:Directory "$($script:Filename)-$name.xml"
-        if (-not $items) {
-            $items = [PSCustomObject]@{ Info = "No results collected" }
-        }
-        $items | Export-Clixml -Path $file -Force
-    }
-}
 
 $script:Format = {
     param(
@@ -312,13 +308,30 @@ $script:Recursive = {
         [string]$GroupName,
         [string]$SecurityGroup,
         [string]$ParentPath = "",
-        [hashtable]$AccessPaths
+        [ref]$AccessPaths
     )
     try {
         $results = @()
-        $members = Get-ADGroupMember -Identity $GroupSID -Server $script:ADDomain.PDCEmulator
+        
+        $groupIdentity = $GroupSID
+        try {
+            $groupObject = Get-ADGroup -Identity $GroupSID -Server $script:ADDomain.PDCEmulator -ErrorAction Stop
+            $groupIdentity = $groupObject.Name
+            LogThis -m "Resolved SID $GroupSID to group name: $groupIdentity" -lvl Debug
+        } catch {
+            LogThis -m "Could not resolve SID $GroupSID to group name, using SID directly" -lvl Debug
+            $groupIdentity = $GroupSID
+        }
+        
+        try {
+            $members = Get-ADGroupMember -Identity $groupIdentity -Server $script:ADDomain.PDCEmulator
+            LogThis -m "Successfully retrieved $($members.Count) members from group $groupIdentity" -lvl Debug
+        } catch {
+            LogThis -m "Failed to get members from group $groupIdentity (SID: $GroupSID): $_" -lvl Warn
+            return @()
+        }
 
-        $currentPath = if ($ParentPath) { "$ParentPath -> $GroupName" } else { $GroupName }
+        $currentPath = if ($ParentPath) { "$ParentPath <- $GroupName" } else { $GroupName }
 
         foreach ($member in $members) {
             if ($member.objectClass -eq 'group') {
@@ -344,31 +357,80 @@ $script:Recursive = {
                 }
             }
             else {
-                # Process user member.
-                $user = Get-ADUser $member -Properties LastLogonDate, PasswordLastSet, ServicePrincipalName, Enabled, DistinguishedName -Server $script:ADDomain.PDCEmulator
 
-                $results += [PSCustomObject]@{
-                    Name              = $user.Name
-                    SamAccountName    = $user.SamAccountName
-                    Group             = $GroupName
-                    Enabled           = $user.Enabled
-                    LastLogonDate     = & $script:Format $user.LastLogonDate
-                    PasswordLastSet   = & $script:Format $user.PasswordLastSet
-                    SPNs              = $user.ServicePrincipalName -join ','
-                    ObjectType        = "User"
-                    NestedPath        = $currentPath
-                    DistinguishedName = $user.DistinguishedName
-                }
+                try {
+                    if ($member.objectClass -eq 'computer') {
 
-                # *** This block populates AccessPaths ***
-                if ($AccessPaths) {
-                    if (-not $AccessPaths.ContainsKey($user.SamAccountName)) {
-                        $AccessPaths[$user.SamAccountName] = @{}
+                        $computer = Get-ADComputer $member -Properties LastLogonDate, PasswordLastSet, ServicePrincipalName, Enabled, DistinguishedName, CanonicalName -Server $script:ADDomain.PDCEmulator
+                        
+                        $results += [PSCustomObject]@{
+                            Name              = $computer.Name
+                            SamAccountName    = $computer.SamAccountName
+                            Group             = $GroupName
+                            Enabled           = $computer.Enabled
+                            LastLogonDate     = $computer.LastLogonDate
+                            PasswordLastSet   = $computer.PasswordLastSet
+                            SPNs              = $computer.ServicePrincipalName -join ','
+                            ObjectType        = "Computer"
+                            NestedPath        = $currentPath
+                            DistinguishedName = $computer.DistinguishedName
+                            CanonicalName     = $computer.CanonicalName
+                        }
+                    } else {
+
+                        $user = Get-ADUser $member -Properties LastLogonDate, PasswordLastSet, ServicePrincipalName, Enabled, DistinguishedName, CanonicalName -Server $script:ADDomain.PDCEmulator
+
+                        $results += [PSCustomObject]@{
+                            Name              = $user.Name
+                            SamAccountName    = $user.SamAccountName
+                            Group             = $GroupName
+                            Enabled           = $user.Enabled
+                            LastLogonDate     = $user.LastLogonDate
+                            PasswordLastSet   = $user.PasswordLastSet
+                            SPNs              = $user.ServicePrincipalName -join ','
+                            ObjectType        = "User"
+                            NestedPath        = $currentPath
+                            DistinguishedName = $user.DistinguishedName
+                            CanonicalName     = $user.CanonicalName
+                        }
                     }
-                    $isDirect = $currentPath -eq $SecurityGroup
-                    if (-not ($AccessPaths[$user.SamAccountName].ContainsKey($SecurityGroup) -and 
-                           $AccessPaths[$user.SamAccountName][$SecurityGroup] -eq "Direct member")) {
-                        $AccessPaths[$user.SamAccountName][$SecurityGroup] = if ($isDirect) { "Direct member" } else { $currentPath }
+
+                    if ($AccessPaths) {
+                        $accountName = if ($member.objectClass -eq 'computer') { $computer.SamAccountName } else { $user.SamAccountName }
+                        if (-not $AccessPaths.Value.ContainsKey($accountName)) {
+                            $AccessPaths.Value[$accountName] = @{}
+                        }
+                        $isDirect = $currentPath -eq $SecurityGroup
+                        if (-not ($AccessPaths.Value[$accountName].ContainsKey($SecurityGroup) -and 
+                               $AccessPaths.Value[$accountName][$SecurityGroup] -eq "Direct member")) {
+                            $AccessPaths.Value[$accountName][$SecurityGroup] = if ($isDirect) { "Direct member" } else { $currentPath }
+                        }
+                    }
+                } catch {
+                    $orphanedSID = $member.SID.Value
+                    
+                    # Handle well-known built-in SIDs
+                    $wellKnownName = switch ($orphanedSID) {
+                        'S-1-1-0' { 'Everyone' }
+                        'S-1-5-7' { 'Anonymous Logon' }
+                        'S-1-5-11' { 'Authenticated Users' }
+                        'S-1-5-32-544' { 'Administrators' }
+                        default { 
+                            LogThis -m "Failed to resolve SID $orphanedSID in group $GroupName - skipping" -lvl Warn
+                            continue
+                        }
+                    }
+
+                    if ($wellKnownName) {
+                        LogThis -m "Well-known SID found in group $GroupName - $orphanedSID ($wellKnownName)" -lvl Info
+                        $results += [PSCustomObject]@{
+                            Name = $wellKnownName
+                            SamAccountName = $wellKnownName
+                            Group = $GroupName
+                            Enabled = $true
+                            ObjectType = "WellKnownSID"
+                            NestedPath = $currentPath
+                        }
                     }
                 }
             }
@@ -380,7 +442,6 @@ $script:Recursive = {
     }
 }
 
-
 $script:Validate = {
     [CmdletBinding()]
     param (
@@ -389,7 +450,8 @@ $script:Validate = {
     )
     
     try {
-        $null = [System.IO.Compression.ZipFile]::OpenRead($Path) # Expand zip for integrity check
+        # Expand zip for integrity check
+        $null = [System.IO.Compression.ZipFile]::OpenRead($Path)
         return $true
     }
     catch {
@@ -411,42 +473,56 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     throw
 }
 
-#endregion  ## HIDE ##
-
 function Get-Controls {
     [CmdletBinding()]
     param()
 
-    $not = "Not Found"
-    $nul = "<null>"
-    $ope = "Error"
-    $0 = "0"
+    $notFound = "Not Found"
+    $nullValue = "<null>"
+    $errorValue = "Error"
     
     try {
         LogThis -m "Starting Get-Controls" -lvl Header -show "GATHERING ACTIVE DIRECTORY" 
 
-        $Controls = [ordered]@{ # [ordered] maintains execution order
+        # [ordered] maintains execution order
+        $Controls = [ordered]@{ 
+            
             'RUNTIME' = {
                 $system = Get-CimInstance -ClassName Win32_ComputerSystem
                 $os = Get-CimInstance -ClassName Win32_OperatingSystem
                 $domainType = if ($system.PartOfDomain) { 'Domain-Joined' } else { 'Workgroup-Joined' }
                 $domainName = if ($system.PartOfDomain) { $system.Domain } else { $system.Workgroup }
-                @($system) | & $script:ExportRaw  
+                $commandLine = $PSCommandPath
+                if ($Duo) { $commandLine += " -Duo" }
+                if ($Proxy) { $commandLine += " -Proxy" }
+                if ($Dns) { $commandLine += " -Dns" }
+                
+                $location = $notFound 
+                try {
+                    $publicIP = (Invoke-RestMethod -Uri "https://ipinfo.io/ip" -TimeoutSec 2 -ErrorAction Stop).Trim()
+                    $geoData = Invoke-RestMethod -Uri "https://ipinfo.io/$publicIP/json" -TimeoutSec 2 -ErrorAction Stop
+                    $location = "$($geoData.city), $($geoData.region), $($geoData.country)"
+                    if ($geoData.org) { $location += " ($($geoData.org))" }
+                } catch {
+                    LogThis -m "$notFound : $($_.Exception.Message)" -lvl Debug
+                }
+                
                 [ordered]@{
                     'Time' = & $script:Format $script:StartTime -Format Display
                     'User' = [Security.Principal.WindowsIdentity]::GetCurrent().Name
                     'Host (+)' = "(Name) $($env:COMPUTERNAME), (OS) $($os.Caption), (Build) $($os.Version)"
                     'Network (+)' = "(Type) $domainType, (Name) $domainName"
-                    'PowerShell (+)' = "(User) $([System.Security.Principal.WindowsIdentity]::GetCurrent().Name), (Host) $($Host.Name), (Version) $($PSVersionTable.PSVersion), (InvokePath) $($PSCommandPath)"
+                    'Location' = "**Approximate Only** $location"
+                    'PowerShell (+)' = "(User) $([System.Security.Principal.WindowsIdentity]::GetCurrent().Name), (Host) $($Host.Name), (Version) $($PSVersionTable.PSVersion), (InvokePath) $commandLine"
                 } | & $script:Export -Name $section -IsSummary
             }
             
             'TOPOLOGY' = {
-                Get-ADObject -Filter * -SearchBase ((Get-ADRootDSE).configurationNamingContext) -Server $script:ADDomain.PDCEmulator -Properties * | & $script:ExportRaw
-
                 try {
                     $configuration = (Get-ADRootDSE).configurationNamingContext
                     $ds = Get-ADObject -Filter 'objectClass -eq "nTDSService"' -SearchBase $configuration -Properties dSHeuristics -Server $script:ADDomain.PDCEmulator
+                    LogThis -m "dSHeuristics object retrieved: $($ds.DistinguishedName)" -lvl Debug
+                    LogThis -m "dSHeuristics value: '$($ds.dSHeuristics)' (Type: $(if ($ds.dSHeuristics) { $ds.dSHeuristics.GetType().Name } else { 'null' }))" -lvl Debug
                     
                     $dcs = foreach ($dc in $script:ADDomain.ReplicaDirectoryServers) {
                         try {
@@ -457,75 +533,164 @@ function Get-Controls {
                         }
                     }
 
-                    $rootDSE = Get-ADRootDSE -Server $script:ADDomain.PDCEmulator
-                    $partitions = $rootDSE.namingContexts
-
-                    ([pscustomobject][ordered]@{
-                        Configuration = $configuration
-                        NTDSObjects = $ds
-                        DomainControllers = $dcs
-                        NamingContexts = $partitions
-                        Domain = $script:ADDomain
-                        Forest = $script:ADForest
-                    })
-
                     [ordered]@{
-                        'Heirarchy (+)' = "(Current/Target Domain) $($script:ADDomain.Name), (Parent) $(if ($script:ADDomain.ParentDomain) { $script:ADDomain.ParentDomain } else { 'I Am Root' })"
+                        'Heirarchy (+)' = "(Current/Target Domain) $($script:ADDomain.DNSRoot), (Parent) $(if ($script:ADDomain.ParentDomain) { $script:ADDomain.ParentDomain } else { 'I Am Root' })"
                         'FunctionalLevels (+)' = "(Forest) $($script:ADForest.ForestMode), (Domain) $($script:ADDomain.DomainMode)"
                         'Sites (+)' = "(Count) $(($script:ADForest.Sites | Measure-Object).Count), (List) $($script:ADForest.Sites -join ', ')"
                         'Domains (+)' = "(Count) $(($script:ADForest.Domains | Measure-Object).Count), (List) $($script:ADForest.Domains -join ', ')"
                         'DomainControllers (+)' = "(Replicas) $(($script:ADDomain.ReplicaDirectoryServers | Measure-Object).Count)$(if ($script:ADDomain.ReadOnlyReplicaDirectoryServers) { ", (RODCs) $(($script:ADDomain.ReadOnlyReplicaDirectoryServers | Measure-Object).Count)" }), (List) $($dcs -join ', ')"
-                        'Domain (+)' = "(DSHeuristics) $(if ($ds.dSHeuristics) { $ds.dSHeuristics } else { $nu }), (DNSRoot) $($script:ADDomain.DNSRoot), (NetBIOS) $($script:ADDomain.NetBIOSName), (SID) $($script:ADDomain.DomainSID.Value)"
+                        'Domain (+)' = "(DSHeuristics) $(if ($ds.dSHeuristics) { $ds.dSHeuristics } else { $nullValue }), (DNSRoot) $($script:ADDomain.DNSRoot), (NetBIOS) $($script:ADDomain.NetBIOSName), (SID) $($script:ADDomain.DomainSID.Value)"
                         'GlobalCatalogs (+)' = "(Count) $(($script:ADForest.GlobalCatalogs | Measure-Object).Count), (List) $($script:ADForest.GlobalCatalogs -join ', ')"
                         'FSMORoleHolders (+)' = "(SchemaMaster) $($script:ADForest.SchemaMaster), (DomainNamingMaster) $($script:ADForest.DomainNamingMaster), (PDCEmulator) $($script:ADDomain.PDCEmulator), (RIDMaster) $($script:ADDomain.RIDMaster), (InfrastructureMaster) $($script:ADDomain.InfrastructureMaster)"
-                        'PartitionBackup_Forest_DNSZones' = Get-BackupTime "DC=ForestDnsZones,"
-                        'PartitionBackup_Domain' = Get-BackupTime "^DC=(?!.*DnsZones)"
-                        'PartitionBackup_Domain_Schema' = Get-BackupTime "CN=Schema,"
-                        'PartitionBackup_Configuration' = Get-BackupTime "CN=Configuration,"
-                        'PPartitionBackup_DomainDNSZones' = Get-BackupTime "DC=DomainDnsZones,"
                     } | & $script:Export -Name $section -IsSummary
                 } catch {
-                    LogThis -m "Failed getting topology info: $_" -lvl Error
+                    LogThis -m "Failed getting topology: $_" -lvl Error
+                    @() | & $script:Export -Name $section -IsError
                     [ordered]@{
-                        'Heirarchy (+)' = "(Current/Target) $ope, (Parent) $ope"
-                        'FunctionalLevels (+)' = "(Forest) $ope, (Domain) $ope"
-                        'Sites (+)' = "(Count) $ope, (List) $ope"
-                        'Domains (+)' = "(Count) $ope, (List) $ope"
-                        'DomainControllers (+)' = "(Replicas) $ope, (RODCs) $ope, (List) $ope"
-                        'Domain (+)' = "(DSHeuristics) $ope, (DNSRoot) $ope, (NetBIOS) $ope, (SID) $ope"
-                        'GlobalCatalogs (+)' = "(Count) $ope, (List) $ope"
-                        'FSMORoleHolders (+)' = "(SchemaMaster) $ope, (DomainNamingMaster) $ope, (PDCEmulator) $ope, (RIDMaster) $ope, (InfrastructureMaster) $ope"
-                        'PartitionBackup_Forest_DNSZones' = $ope
-                        'PartitionBackup_Domain_Schema' = $ope
-                        'PartitionBackup_Configuration' = $ope
-                        'PPartitionBackup_DomainDNSZones' = $ope
+                        'Heirarchy (+)' = "(Current/Target) $errorValue, (Parent) $errorValue"
+                        'FunctionalLevels (+)' = "(Forest) $errorValue, (Domain) $errorValue"
+                        'Sites (+)' = "(Count) $errorValue, (List) $errorValue"
+                        'Domains (+)' = "(Count) $errorValue, (List) $errorValue"
+                        'DomainControllers (+)' = "(Replicas) $errorValue, (RODCs) $errorValue, (List) $errorValue"
+                        'Domain (+)' = "(DSHeuristics) $errorValue, (DNSRoot) $errorValue, (NetBIOS) $errorValue, (SID) $errorValue"
+                        'GlobalCatalogs (+)' = "(Count) $errorValue, (List) $errorValue"
+                        'FSMORoleHolders (+)' = "(SchemaMaster) $errorValue, (DomainNamingMaster) $errorValue, (PDCEmulator) $errorValue, (RIDMaster) $errorValue, (InfrastructureMaster) $errorValue"
+                    } | & $script:Export -Name $section -IsSummary
+                }
+            }
+
+            'PARTITIONS' = {
+                try {
+                    $rootDSE = Get-ADRootDSE -Server $script:ADDomain.PDCEmulator
+                    $partitions = $rootDSE.namingContexts
+
+                    $backupData = @()               
+                    $partition = $partitions | Where-Object { $_ -match "DC=ForestDnsZones," } | Select-Object -First 1
+                    if ($partition) {
+                        $metadata = Get-ADReplicationAttributeMetadata -Object $partition -Properties dSASignature -Server $script:ADDomain.PDCEmulator
+                        $backup = $metadata.LastOriginatingChangeTime
+                        if ($backup) {
+                            $timeSpan = New-TimeSpan -Start $backup -End $script:StartTime
+                            $years = [math]::Floor($timeSpan.TotalDays / 365)
+                            $months = [math]::Floor(($timeSpan.TotalDays % 365) / 30)
+                            $days = [math]::Floor($timeSpan.TotalDays % 30)
+                            $backupData += [PSCustomObject][ordered]@{
+                                'Partition' = 'Forest DNS Zones'
+                                'LastBackup' = "$(Get-Date $backup -Format 'dd MMM yyyy')"
+                                'Elapsed' = "${years}y:${months}m:${days}d"
+                                'BackupDate' = $backup
+                            }
+                        }
+                    }
+
+                    $partition = $partitions | Where-Object { $_ -match "^DC=(?!.*DnsZones)" } | Select-Object -First 1
+                    if ($partition) {
+                        $metadata = Get-ADReplicationAttributeMetadata -Object $partition -Properties dSASignature -Server $script:ADDomain.PDCEmulator
+                        $backup = $metadata.LastOriginatingChangeTime
+                        if ($backup) {
+                            $timeSpan = New-TimeSpan -Start $backup -End $script:StartTime
+                            $years = [math]::Floor($timeSpan.TotalDays / 365)
+                            $months = [math]::Floor(($timeSpan.TotalDays % 365) / 30)
+                            $days = [math]::Floor($timeSpan.TotalDays % 30)
+                            $backupData += [PSCustomObject][ordered]@{
+                                'Partition' = 'Domain'
+                                'LastBackup' = "$(Get-Date $backup -Format 'dd MMM yyyy')"
+                                'Elapsed' = "${years}y:${months}m:${days}d"
+                                'BackupDate' = $backup
+                            }
+                        }
+                    }
+
+                    $partition = $partitions | Where-Object { $_ -match "CN=Schema," } | Select-Object -First 1
+                    if ($partition) {
+                        $metadata = Get-ADReplicationAttributeMetadata -Object $partition -Properties dSASignature -Server $script:ADDomain.PDCEmulator
+                        $backup = $metadata.LastOriginatingChangeTime
+                        if ($backup) {
+                            $timeSpan = New-TimeSpan -Start $backup -End $script:StartTime
+                            $years = [math]::Floor($timeSpan.TotalDays / 365)
+                            $months = [math]::Floor(($timeSpan.TotalDays % 365) / 30)
+                            $days = [math]::Floor($timeSpan.TotalDays % 30)
+                            $backupData += [PSCustomObject][ordered]@{
+                                'Partition' = 'Domain Schema'
+                                'LastBackup' = "$(Get-Date $backup -Format 'dd MMM yyyy')"
+                                'Elapsed' = "${years}y:${months}m:${days}d"
+                                'BackupDate' = $backup
+                            }
+                        }
+                    }
+
+                    $partition = $partitions | Where-Object { $_ -match "CN=Configuration," } | Select-Object -First 1
+                    if ($partition) {
+                        $metadata = Get-ADReplicationAttributeMetadata -Object $partition -Properties dSASignature -Server $script:ADDomain.PDCEmulator
+                        $backup = $metadata.LastOriginatingChangeTime
+                        if ($backup) {
+                            $timeSpan = New-TimeSpan -Start $backup -End $script:StartTime
+                            $years = [math]::Floor($timeSpan.TotalDays / 365)
+                            $months = [math]::Floor(($timeSpan.TotalDays % 365) / 30)
+                            $days = [math]::Floor($timeSpan.TotalDays % 30)
+                            $backupData += [PSCustomObject][ordered]@{
+                                'Partition' = 'Configuration'
+                                'LastBackup' = "$(Get-Date $backup -Format 'dd MMM yyyy')"
+                                'Elapsed' = "${years}y:${months}m:${days}d"
+                                'BackupDate' = $backup
+                            }
+                        }
+                    }
+
+                    $partition = $partitions | Where-Object { $_ -match "DC=DomainDnsZones," } | Select-Object -First 1
+                    if ($partition) {
+                        $metadata = Get-ADReplicationAttributeMetadata -Object $partition -Properties dSASignature -Server $script:ADDomain.PDCEmulator
+                        $backup = $metadata.LastOriginatingChangeTime
+                        if ($backup) {
+                            $timeSpan = New-TimeSpan -Start $backup -End $script:StartTime
+                            $years = [math]::Floor($timeSpan.TotalDays / 365)
+                            $months = [math]::Floor(($timeSpan.TotalDays % 365) / 30)
+                            $days = [math]::Floor($timeSpan.TotalDays % 30)
+                            $backupData += [PSCustomObject][ordered]@{
+                                'Partition' = 'Domain DNS Zones'
+                                'LastBackup' = "$(Get-Date $backup -Format 'dd MMM yyyy')"
+                                'Elapsed' = "${years}y:${months}m:${days}d"
+                                'BackupDate' = $backup
+                            }
+                        }
+                    }
+
+                    if ($backupData.Count -gt 0) {
+                        $backupData | ForEach-Object {
+                            [ordered]@{
+                                $_.Partition = "$($_.LastBackup) [$($_.Elapsed)]"
+                            }
+                        } | & $script:Export -Name $section -IsSummary
+                    } else {
+                        [ordered]@{
+                            'Summary (+)' = "No partition backup data found"
+                        } | & $script:Export -Name $section -IsSummary
+                    }
+                } catch {
+                    LogThis -m "Failed checking partition backups: $_" -lvl Error
+                    @() | & $script:Export -Name $section -IsError
+                    [ordered]@{
+                        'Summary (+)' = "(Total Partitions) $errorValue, (Oldest) $errorValue, (Newest) $errorValue"
                     } | & $script:Export -Name $section -IsSummary
                 }
             }
 
             'PASSWORD_POLICY' = {
-                Get-ADDefaultDomainPasswordPolicy -Server $script:ADDomain.PDCEmulator | & $script:ExportRaw
-
                 try {
                     $policy = Get-ADDefaultDomainPasswordPolicy -Server $script:ADDomain.PDCEmulator
-
+                    
                     [ordered]@{
-                        'ComplexityEnabled' = if ($policy) { $policy.ComplexityEnabled } else { $not }
-                        'MinLength' = if ($policy) { $policy.MinPasswordLength } else { $not }
-                        'Age (+)' = if ($policy) { "(Min) $($policy.MinPasswordAge.Days)d:$($policy.MinPasswordAge.Hours)h:$($policy.MinPasswordAge.Minutes)m, (Max) $($policy.MaxPasswordAge.Days)d:$($policy.MaxPasswordAge.Hours)h:$($policy.MaxPasswordAge.Minutes)m" } else { "(Min) $not, (Max) $not" }
-                        'Lockout (+)' = if ($policy) { "(Threshold) $($policy.LockoutThreshold), (Duration) $($policy.LockoutDuration.Days)d:$($policy.LockoutDuration.Hours)h:$($policy.LockoutDuration.Minutes)m" } else { "(Threshold) $not, (Duration) $not" }
-                        'HistoryCount' = if ($policy) { $policy.PasswordHistoryCount } else { $not }
-                        'ReversibleEncryptionEnabled' = if ($policy) { $policy.ReversibleEncryptionEnabled } else { $not }
+                        'Settings (+)' = if ($policy) { "(ComplexityEnabled) $($policy.ComplexityEnabled), (MinLength) $($policy.MinPasswordLength), (HistoryCount) $($policy.PasswordHistoryCount), (ReversibleEncryptionEnabled) $($policy.ReversibleEncryptionEnabled)" } else { "(ComplexityEnabled) $notFound, (MinLength) $notFound, (HistoryCount) $notFound, (ReversibleEncryptionEnabled) $notFound" }
+                        'Age (+)' = if ($policy) { "(Min) $($policy.MinPasswordAge.Days)d:$($policy.MinPasswordAge.Hours)h:$($policy.MinPasswordAge.Minutes)m, (Max) $($policy.MaxPasswordAge.Days)d:$($policy.MaxPasswordAge.Hours)h:$($policy.MaxPasswordAge.Minutes)m" } else { "(Min) $notFound, (Max) $notFound" }
+                        'Lockout (+)' = if ($policy) { "(Threshold) $($policy.LockoutThreshold), (Duration) $($policy.LockoutDuration.Days)d:$($policy.LockoutDuration.Hours)h:$($policy.LockoutDuration.Minutes)m" } else { "(Threshold) $notFound, (Duration) $notFound" }
                     } | & $script:Export -Name $section -IsSummary
                 } catch {
                     LogThis -m "Failed getting password policy: $_" -lvl Error
-                    @{
-                        'ComplexityEnabled' = $ope
-                        'MinLength' = $ope
-                        'Age (+)' = "(Min) $ope, (Max) $ope"
-                        'Lockout (+)' = "(Threshold) $ope, (Duration) $ope"
-                        'HistoryCount' = $ope
-                        'ReversibleEncryptionEnabled' = $ope
+                    @() | & $script:Export -Name $section -IsError
+                    [ordered]@{
+                        'Settings (+)' = "(ComplexityEnabled) $errorValue, (MinLength) $errorValue, (HistoryCount) $errorValue, (ReversibleEncryptionEnabled) $errorValue"
+                        'Age (+)' = "(Min) $errorValue, (Max) $errorValue"
+                        'Lockout (+)' = "(Threshold) $errorValue, (Duration) $errorValue"
                     } | & $script:Export -Name $section -IsSummary
                 }
             }
@@ -542,6 +707,58 @@ function Get-Controls {
                     foreach ($gpo in $Gpos) {
                         LogThis -m "Processing GPO: $($gpo.DisplayName)" -lvl Debug
                         Get-GPOReport -Name $gpo.DisplayName -ReportType Xml -Path (Join-Path $script:GPODirectory "$($gpo.DisplayName).xml") -Server $script:ADDomain.PDCEmulator
+                        Get-GPOReport -Name $gpo.DisplayName -ReportType Html -Path (Join-Path $script:GPODirectory "$($gpo.DisplayName).html") -Server $script:ADDomain.PDCEmulator
+                    }
+
+                    # GPO OU precedence
+                    LogThis -m "Getting GPO precedence order" -lvl Debug
+                    $precedenceData = @()
+                    $ous = Get-ADOrganizationalUnit -Filter * -Server $script:ADDomain.PDCEmulator
+                    
+                    foreach ($ou in $ous) {
+                        try {
+                            $gpoLinks = Get-GPInheritance -Target $ou.DistinguishedName -Server $script:ADDomain.PDCEmulator
+                            
+                            # Computer precedence
+                            foreach ($gpo in $gpoLinks.GpoInheritance) {
+                                if ($null -ne $gpo.GpoId) {
+                                    $gpoInfo = Get-GPO -Guid $gpo.GpoId -Server $script:ADDomain.PDCEmulator
+                                    $precedenceData += [PSCustomObject]@{
+                                        'OU' = $ou.Name
+                                        'OUDN' = $ou.DistinguishedName
+                                        'GPOName' = $gpoInfo.DisplayName
+                                        'GPOId' = $gpo.GpoId
+                                        'Precedence' = $gpo.Order
+                                        'Enforced' = $gpo.Enforced
+                                        'BlockInheritance' = $gpoLinks.BlockInheritance
+                                        'SettingsType' = 'Computer'
+                                    }
+                                }
+                            }
+                            
+                            # User precedence
+                            foreach ($gpo in $gpoLinks.GpoInheritance) {
+                                if ($null -ne $gpo.GpoId) {
+                                    $gpoInfo = Get-GPO -Guid $gpo.GpoId -Server $script:ADDomain.PDCEmulator
+                                    $precedenceData += [PSCustomObject]@{
+                                        'OU' = $ou.Name
+                                        'OUDN' = $ou.DistinguishedName
+                                        'GPOName' = $gpoInfo.DisplayName
+                                        'GPOId' = $gpo.GpoId
+                                        'Precedence' = $gpo.Order
+                                        'Enforced' = $gpo.Enforced
+                                        'BlockInheritance' = $gpoLinks.BlockInheritance
+                                        'SettingsType' = 'User'
+                                    }
+                                }
+                            }
+                        } catch {
+                            LogThis -m "Failed getting GPO precedence for OU: $($ou.Name)" -lvl Debug
+                        }
+                    }
+                    
+                    if ($precedenceData) {
+                        $precedenceData | & $script:Export -Name "$section-Precedence"
                     }
 
                     [ordered]@{
@@ -549,42 +766,55 @@ function Get-Controls {
                     } | & $script:Export -Name $section -IsSummary
                 } catch {
                     LogThis -m "Failed processing GPOs" -lvl Error -ex $_
+                    @() | & $script:Export -Name $section -IsError
                     [ordered]@{
-                        'GroupPolicyObjects (+)' = "(Total) $not, (Orphaned) $not, (AllSettingsDisabled) $not, (ComputerSettingsDisabled) $not, (UserSettingsDisabled) $not"
+                        'GroupPolicyObjects (+)' = "(Total) $notFound, (Orphaned) $notFound, (AllSettingsDisabled) $notFound, (ComputerSettingsDisabled) $notFound, (UserSettingsDisabled) $notFound"
                     } | & $script:Export -Name $section -IsSummary
                 }
             }
 
             'TRUSTS' = {
-                Get-ADTrust -Filter * -Properties * -Server $script:ADDomain.PDCEmulator | & $script:ExportRaw
                 try {
-                    $trusts = Get-ADTrust -Filter * -Properties * -Server $script:ADDomain.PDCEmulator
+                    $trusts = Get-ADTrust -Filter * -Server $script:ADDomain.PDCEmulator
                     if ($trusts) {
                         $trusts | ForEach-Object {
                             [PSCustomObject][ordered]@{
-                                'Name' = $_.Name
+                                'Source' = $_.Source
+                                'Target' = $_.Target
                                 'Direction' = $_.Direction
-                                'Type' = $_.TrustType
-                                'Created' = & $script:Format $_.Created -Format Display
-                                'Modified' = & $script:Format $_.Modified -Format Display
-                                'SIDFiltering' = $_.SIDFilteringEnabled
-                                'Selective' = $_.SelectiveAuthentication
-                                'TGTDelegation' = $_.TGTDelegationEnabled
-                                'Transitive' = $_.IsTreeRoot
-                                'Status' = if ($_.IntraForest) { 'Intra-Forest' } else { 'Inter-Forest' }
-                            } 
+                                'IntraForest' = $_.IntraForest
+                                'SelectiveAuth' = if ($_.SelectiveAuth -is [boolean]) { if ($_.SelectiveAuth) { 'TRUE' } else { 'FALSE' } } elseif ($_.SelectiveAuth) { $_.SelectiveAuth } else { '<null> Not Forest Trust' }
+                                'TrustType' = switch ($_.TrustType) {
+                                    'MIT'       { 'MIT (Realm)' }
+                                    'Downlevel' { 'Downlevel (External)' }
+                                    'Uplevel'   { if ($_.IntraForest) { 'Uplevel (Forest)' } else { 'Uplevel (External)' } }
+                                    default     { "$($_.TrustType) (Unknown)" }
+                                }
+                                'SIDFilteringForestAware' = if ($_.SIDFilteringForestAware -is [boolean]) { if ($_.SIDFilteringForestAware) { 'TRUE' } else { 'FALSE' } } elseif ($_.SIDFilteringForestAware) { $_.SIDFilteringForestAware } else { '' }
+                                'SIDFilteringQuarantined' = if ($_.SIDFilteringQuarantined -is [boolean]) { if ($_.SIDFilteringQuarantined) { 'TRUE' } else { 'FALSE' } } elseif ($_.SIDFilteringQuarantined) { $_.SIDFilteringQuarantined } else { '' }
+                                'Transitive' = if ($_.IsTransitive) { 'TRUE' } else { 'FALSE' }
+                            }
                         } | & $script:Export -Name $section
+                    } else {
+                        @() | & $script:Export -Name $section -NoResults
                     }
-                    
+                    $trustList = @()
+                    if ($trusts) {
+                        if ($trusts -is [System.Array]) {
+                            $trustList = $trusts
+                        } else {
+                            $trustList = @($trusts)
+                        }
+                    }
+                    $partnerList = if ($trustList.Count -gt 0) { ($trustList | ForEach-Object { $_.Target }) -join ', ' } else { '<none>' }
+                    $totalTrusts = $trustList.Count
                     [PSCustomObject][ordered]@{
-                        'Summary (+)' = "(Total) $($trusts.Count), " +
-                                    "(Bidirectional) $(($trusts | Where-Object Direction -eq 'BiDirectional').Count), " +
-                                    "(Inbound) $(($trusts | Where-Object Direction -eq 'Inbound').Count), " +
-                                    "(Outbound) $(($trusts | Where-Object Direction -eq 'Outbound').Count)"
+                        'Summary (+)' = "(Total) $totalTrusts, (Partners) $partnerList"
                     } | & $script:Export -Name $section -IsSummary
                 }
                 catch {
                     Write-Warning "Error in TRUSTS section: $_"
+                    @() | & $script:Export -Name $section -IsError
                     [ordered]@{
                         'Summary (+)' = "(Error) Unable to enumerate trusts"
                     } | & $script:Export -Name $section -IsSummary
@@ -592,7 +822,6 @@ function Get-Controls {
             }
 
             'SID500' = {
-                $sid = "$($script:ADDomain.DomainSID.Value)-500"; Get-ADUser -Identity $sid -Properties * -Server $script:ADDomain.PDCEmulator | & $script:ExportRaw
                 try {
                     $sid = "$($script:ADDomain.DomainSID.Value)-500"
                     $administrator = Get-ADUser -Identity $sid -Properties LastLogonDate, PasswordLastSet -Server $script:ADDomain.PDCEmulator
@@ -602,347 +831,649 @@ function Get-Controls {
 
                     [ordered]@{
                         'Default' = "(SamAccountName) $($administrator.SamAccountName), (Name) $($administrator.Name), (Enabled) $($administrator.Enabled)"
-                        'Logon' = "$(Get-Date $administrator.LastLogonDate -Format 'dd MMM yyyy') [$([math]::Floor($logonAge.TotalDays / 365))y$([math]::Floor(($logonAge.TotalDays % 365) / 30))m$([math]::Floor($logonAge.TotalDays % 30))d]"
-                        'Password' = "$(Get-Date $administrator.PasswordLastSet -Format 'dd MMM yyyy') [$([math]::Floor($passwordAge.TotalDays / 365))y$([math]::Floor(($passwordAge.TotalDays % 365) / 30))m$([math]::Floor($passwordAge.TotalDays % 30))d]"
+                        'Administrator (+) ' = "(LastLogonDate) $(Get-Date $administrator.LastLogonDate -Format 'dd MMM yyyy') [$([math]::Floor($logonAge.TotalDays / 365))y:$([math]::Floor(($logonAge.TotalDays % 365) / 30))m:$([math]::Floor($logonAge.TotalDays % 30))d], (PasswordLastSet) $(Get-Date $administrator.PasswordLastSet -Format 'dd MMM yyyy') [$([math]::Floor($passwordAge.TotalDays / 365))y:$([math]::Floor(($passwordAge.TotalDays % 365) / 30))m:$([math]::Floor($passwordAge.TotalDays % 30))d]"
                     } | & $script:Export -Name $section -IsSummary
                 } catch {
                     LogThis -m "Failed checking SID500: $_" -lvl Error
+                    @() | & $script:Export -Name $section -IsError
                     [ordered]@{
-                        'Default' = $ope
-                        'Logon' = $ope
-                        'Password' = $ope
+                        'Default' = $notFound
+                        'Administrator (+) ' = "(LastLogonDate) $notFound, (PasswordLastSet) $notFound"
                     } | & $script:Export -Name $section -IsSummary
                 }
             }
 
-            'PRIVILIGED' = {
-                $script:PrivilegedGroups.Values | ForEach-Object { Get-ADGroup -Identity $_ -Properties * -Server $script:ADDomain.PDCEmulator } | & $script:ExportRaw
-
+            'PRIVILEGED' = {
                 $groups = @()
                 $accessPaths = @{}
                 $summary = @{}
+                $adminGroupTotals = @{}
 
                 foreach ($group in $script:PrivilegedGroups.GetEnumerator()) {
                     try {
                         LogThis -m "Processing: $($group.Key), SID: $($group.Value)" -lvl Debug
                         
-                        $members = & $script:Recursive -GroupSID $group.Value `
-                                                    -GroupName $group.Key `
-                                                    -SecurityGroup $group.Key `
-                                                    -AccessPaths $accessPaths
+                        # Validate SID before processing
+                        if ([string]::IsNullOrWhiteSpace($group.Value)) { 
+                            LogThis -m "Skipping $($group.Key) - invalid SID: $($group.Value)" -lvl Warn
+                            continue
+                        }
+                        
+                        try {
+                            $members = & $script:Recursive -GroupSID $group.Value `
+                                                        -GroupName $group.Key `
+                                                        -SecurityGroup $group.Key `
+                                                        -AccessPaths ([ref]$accessPaths)
+                            LogThis -m "Recursive call successful for $($group.Key)" -lvl Debug
+                        } catch {
+                            LogThis -m "Recursive call failed for $($group.Key): $_" -lvl Error
+                            $members = @()
+                        }
                         LogThis -m "$($group.Key) contains: $($members.Count) members" -lvl Debug
+                        
+                        # Log Administrators membership
+                        if ($group.Key -eq 'Administrators') {
+                            $adminGroups = $members | Where-Object { $_.ObjectType -eq 'Group' }
+                            if ($adminGroups) {
+                                LogThis -m "Administrators contains nested groups: $($adminGroups.Name -join ', ')" -lvl Info
+                                foreach ($adminGroup in $adminGroups) {
+                                    LogThis -m "  - $($adminGroup.Name) (Path: $($adminGroup.NestedPath))" -lvl Info
+                                }
+                            } else {
+                                LogThis -m "Administrators doesn't contain nested groups" -lvl Info
+                            }
+                        }
 
-                        if ($members) {
-                            $groups += $members
-                            $enabled = ($members | Where-Object { $_.ObjectType -eq 'User' } | Sort-Object -Unique SamAccountName).Count
-                            $disabled = ($members | Where-Object { $_.ObjectType -eq 'User' -and -not $_.Enabled } | Sort-Object -Unique SamAccountName).Count
-                            $summary["[$($group.Key)] Enabled: $enabled Disabled: $disabled"] = ""
+                        $groups += $members
+                       
+                        $enabled = ""
+                        $disabled = ""
+                        
+                        # Only count if array populated
+                        if ($members -and $members -is [array] -and $members.Count -gt 0) {
+                            $enabled = ($members | Where-Object { $_.ObjectType -eq 'User' -and $_.Enabled -eq $true } | Sort-Object -Unique SamAccountName).Count
+                            $disabled = ($members | Where-Object { $_.ObjectType -eq 'User' -and $_.Enabled -eq $false } | Sort-Object -Unique SamAccountName).Count
+                        } elseif ($members -and $members -is [array] -and $members.Count -eq 0) {
+                            $enabled = 0
+                            $disabled = 0
+                        }
+                        
+                        # Else leave enabled blank
+                        if ($group.Key -eq 'Protected Users') {
+                            LogThis -m "Protected Users - Total members: $($members.Count), Users: $(($members | Where-Object { $_.ObjectType -eq 'User' }).Count), Enabled: $enabled, Disabled: $disabled" -lvl Debug
+                            LogThis -m "Protected Users - User objects: $(($members | Where-Object { $_.ObjectType -eq 'User' } | ForEach-Object { "$($_.SamAccountName):$($_.Enabled)" }) -join ', ')" -lvl Debug
+                            LogThis -m "Protected Users - All members: $(($members | ForEach-Object { "$($_.SamAccountName):$($_.ObjectType):$($_.Enabled)" }) -join ', ')" -lvl Debug
+                            LogThis -m "Protected Users - Members type: $($members.GetType().FullName), IsNull: $($null -eq $members), IsArray: $($members -is [array])" -lvl Debug
+                            LogThis -m "Protected Users - Members length: $($members.Length), Count property: $($members.Count)" -lvl Debug
+                        }
+                        
+                        $summary["$($group.Key)"] = "(Enabled) $([string]$enabled), (Disabled) $([string]$disabled)"
+                        
+                        # AD Administrators totals
+                        if ($group.Key -in @('Administrators', 'Domain Admins', 'Enterprise Admins', 'Schema Admins')) {
+                            $adminGroupTotals[$group.Key] = @{
+                                Enabled = $enabled
+                                Disabled = $disabled
+                            }
                         }
                     }
                     catch {
                         LogThis -m "Failed processing: $($group.Key), SID: $($group.Value)" -lvl Debug
-                        $summary["[$($group.Key)] Enabled: Error Disabled: Error"] = ""
+                        $summary["$($group.Key)"] = "(Enabled) 0, (Disabled) 0"
+                        if ($group.Key -in @('Administrators', 'Domain Admins', 'Enterprise Admins', 'Schema Admins')) {
+                            $adminGroupTotals[$group.Key] = @{
+                                Enabled = 0
+                                Disabled = 0
+                            }
+                        }
                     }
                 }
                 
-                try { # Pre-Windows 2000
+                $totalEnabled = ($adminGroupTotals.Values | ForEach-Object { $_.Enabled } | Measure-Object -Sum).Sum
+                $totalDisabled = ($adminGroupTotals.Values | ForEach-Object { $_.Disabled } | Measure-Object -Sum).Sum
+                $totalAdmins = $totalEnabled + $totalDisabled
+                
+                $orderedSummary = [ordered]@{}
+                $orderedSummary['Total AD Admins (+) '] = "(Total) $([string]$totalAdmins), (Enabled) $([string]$totalEnabled), (Disabled) $([string]$totalDisabled)"
+                
+                foreach ($adminGroup in @('Administrators', 'Domain Admins', 'Enterprise Admins', 'Schema Admins')) {
+                    if ($summary.ContainsKey($adminGroup)) {
+                        $orderedSummary[$adminGroup] = $summary[$adminGroup]
+                    }
+                }
+                
+                foreach ($group in $summary.Keys) {
+                    if ($group -notin @('Administrators', 'Domain Admins', 'Enterprise Admins', 'Schema Admins')) {
+                        $orderedSummary[$group] = $summary[$group]
+                    }
+                }
+                
+                # Pre-Windows 2000
+                try {
                     $pre2000 = Get-ADGroupMember -Identity "S-1-5-32-554" -Server $script:ADDomain.PDCEmulator
-                    [ordered]@{
-                        'Total' = ($pre2000 | Measure-Object).Count
-                        '[Everyone] is member' = ($pre2000.SID -contains 'S-1-1-0').ToString()
-                        '[ANONYMOUS LOGON] is member' = ($pre2000.SID -contains 'S-1-5-7').ToString()
-                        '[Authenticated Users] is member' = ($pre2000.SID -contains 'S-1-5-11').ToString()
-                    } | & $script:Export -Name $section -IsSummary
+                    $enabledCount = ($pre2000 | Where-Object { $_.Enabled -eq $true } | Measure-Object).Count
+                    $disabledCount = ($pre2000 | Where-Object { $_.Enabled -eq $false } | Measure-Object).Count
+                    $orderedSummary['Pre-Windows 2000 (+) '] = "(Total) $(($pre2000 | Measure-Object).Count), (Enabled) $enabledCount, (Disabled) $disabledCount, (Everyone) is member: $(($pre2000.SID -contains 'S-1-1-0').ToString()), (AnonymousLogon) is member: $(($pre2000.SID -contains 'S-1-5-7').ToString()), (AuthenticatedUsers) is member: $(($pre2000.SID -contains 'S-1-5-11').ToString())"
                 }
                 catch {
-                    [ordered]@{
-                        'Total' = "Error"
-                        '[Everyone] is member' = "Error"
-                        '[ANONYMOUS LOGON] is member' = "Error"
-                        '[Authenticated Users] is member' = "Error"
-                    } | & $script:Export -Name $section -IsSummary
+                    $orderedSummary['Pre-Windows 2000 (+) '] = "(Total) Error, (Enabled) Error, (Disabled) Error, (Everyone) is member: Error, (AnonymousLogon) is member: Error, (AuthenticatedUsers) is member: Error"
                 }
 
                 try {
                     LogThis -m "Creating privileged matrix for $($accessPaths.Count) accounts" -lvl Debug
-                    $script:PrivilegedUsers = @()
+                    LogThis -m "AccessPaths keys: $($accessPaths.Keys -join ', ')" -lvl Debug
+                    LogThis -m "PrivilegedGroups keys: $($script:PrivilegedGroups.Keys -join ', ')" -lvl Debug
+                    if ($accessPaths.Count -eq 0) {
+                        LogThis -m "WARNING: AccessPaths is empty - no users found in privileged groups!" -lvl Warn
+                    }
                     
-                    foreach ($account in $accessPaths.Keys | Sort-Object) {
-                        LogThis -m "Processing: $account" -lvl Debug
-                        LogThis -m "PrivilegedGroups keys: $($script:PrivilegedGroups.Keys -join ', ')" -lvl Debug
-                        LogThis -m "AccessPaths Keys: $($accessPaths.Keys -join ', ')" -lvl Debug
-                        LogThis -m "Groups count: $($groups.Count)" -lvl Debug
-                        $member = $groups | Where-Object { $_.SamAccountName -eq $account } | Select-Object -First 1
+                    $allMembers = @{}
+                    $privilegedGroupNames = $script:PrivilegedGroups.Keys | Sort-Object -Unique
+                    
+                    $domainAdmins = $groups | Where-Object { $_.Name -eq "Domain Admins" -or $_.SamAccountName -eq "Domain Admins" }
+                    $enterpriseAdmins = $groups | Where-Object { $_.Name -eq "Enterprise Admins" -or $_.SamAccountName -eq "Enterprise Admins" }
+                    
+                    if ($domainAdmins) {
+                        $daKey = "Domain Admins|Group"
+                        $allMembers[$daKey] = @{
+                            SamAccountName = "Domain Admins"
+                            SID            = ""
+                            ObjectType     = "Group"
+                            Enabled        = $true
+                            Name           = "Domain Admins"
+                            LastLogonDate  = ""
+                            PasswordLastSet = ""
+                        }
                         
-                        if ($member -and $member.ObjectType -eq 'User') {
-                            $obj = [PSCustomObject]@{
-                                SamAccountName  = $account
-                                ObjectType      = "User"
-                                Enabled         = $member.Enabled
-                                LastLogonDate   = & $script:Format $member.LastLogonDate
-                                PasswordLastSet = & $script:Format $member.PasswordLastSet
-                            }
-                            
-                            foreach ($grp in $script:PrivilegedGroups.Keys) {
-                                $value = if ($accessPaths[$account].ContainsKey($grp)) { 
-                                    $accessPaths[$account][$grp].Replace(' -> ', ' <- ')
-                                } else { 
-                                    ""
+                        foreach ($grp in $privilegedGroupNames) {
+                            $daMembership = $groups | Where-Object { $_.SamAccountName -eq "Domain Admins" -and $_.Group -eq $grp }
+                            if ($daMembership) {
+                                $path = $daMembership.NestedPath
+                                if ($path -ne $grp) {
+                                    $path = $path -replace "^$grp <- ", ""
+                                } else {
+                                    $path = "Direct member"
                                 }
-                                $obj | Add-Member -NotePropertyName $grp -NotePropertyValue $value
+                                $allMembers[$daKey][$grp] = $path
                             }
-                            
-                            $script:PrivilegedUsers += $obj
                         }
                     }
+                    
+                    if ($enterpriseAdmins) {
+                        $eaKey = "Enterprise Admins|Group"
+                        $allMembers[$eaKey] = @{
+                            SamAccountName = "Enterprise Admins"
+                            SID            = ""
+                            ObjectType     = "Group"
+                            Enabled        = $true
+                            Name           = "Enterprise Admins"
+                            LastLogonDate  = ""
+                            PasswordLastSet = ""
+                        }
+                        
+                        foreach ($grp in $privilegedGroupNames) {
+                            $eaMembership = $groups | Where-Object { $_.SamAccountName -eq "Enterprise Admins" -and $_.Group -eq $grp }
+                            if ($eaMembership) {
+                                $path = $eaMembership.NestedPath
+                                if ($path -ne $grp) {
+                                    $path = $path -replace "^$grp <- ", ""
+                                } else {
+                                    $path = "Direct member"
+                                }
+                                $allMembers[$eaKey][$grp] = $path
+                            }
+                        }
+                    }
+                    
+                    foreach ($account in $accessPaths.Keys | Sort-Object) {
+                        $member = $groups | Where-Object { $_.SamAccountName -eq $account } | Select-Object -First 1
+                        
+                        if ($member -and ($member.ObjectType -eq 'User' -or $member.ObjectType -eq 'Computer')) {
+                            $key = "$($member.SamAccountName)|$($member.ObjectType)"
+                            if (-not $allMembers.ContainsKey($key)) {
+                                $allMembers[$key] = @{
+                                    SamAccountName = $member.SamAccountName
+                                    SID            = $member.SID
+                                    ObjectType     = $member.ObjectType
+                                    Enabled        = $member.Enabled
+                                    Name           = $member.Name
+                                    LastLogonDate  = if ($member.LastLogonDate) { $member.LastLogonDate.ToString('MM/dd/yyyy') } else { "" }
+                                    PasswordLastSet = if ($member.PasswordLastSet) { $member.PasswordLastSet.ToString('MM/dd/yyyy') } else { "" }
+                                }
+                            }
+                            
+                            foreach ($grp in $privilegedGroupNames) {
+                                if ($accessPaths[$account].ContainsKey($grp)) {
+                                    $path = $accessPaths[$account][$grp]
+
+                                    if ($path -ne "Direct member") {
+                                        $path = $path -replace "^$grp <- ", ""
+                                    }
+                                    $allMembers[$key][$grp] = $path
+                                }
+                            }
+                        }
+                    }
+                    
+                    $matrix = @()
+                    foreach ($entry in $allMembers.Values) {
+                        $row = [ordered]@{
+                            Name            = $entry.Name
+                            SamAccountName  = $entry.SamAccountName
+                            SID             = $entry.SID
+                            Type            = $entry.ObjectType
+                            Enabled         = if ($entry.ObjectType -eq "Group") { "" } else { $entry.Enabled }
+                            LastLogonDate   = $entry.LastLogonDate
+                            PasswordLastSet = $entry.PasswordLastSet
+                            
+                        }
+                        foreach ($grp in $privilegedGroupNames) {
+                            $row[$grp] = if ($entry.ContainsKey($grp)) { $entry[$grp] } else { '' }
+                        }
+                        $matrix += [PSCustomObject]$row
+                    }
+                    
+                    $script:PrivilegedUsers = $matrix
                 }
                 catch {
                     LogThis -m "Privileged matrix failed" -lvl Warn -ex $_
                 }
 
-                if ($groups -or $script:PrivilegedUsers) {
-                    try {
-                        $groups | ConvertTo-Csv -NoTypeInformation | 
-                            Out-File -FilePath (Join-Path $script:Directory "$($script:Filename)-$section-GROUPS.csv") -Encoding UTF8
-                    }
-                    catch {
-                        LogThis -m "Failed exporting privileged groups" -lvl Error -ex $_
-                    }
-
-                    try {
-                        $script:PrivilegedUsers | ConvertTo-Csv -NoTypeInformation | 
-                            Out-File -FilePath (Join-Path $script:Directory "$($script:Filename)-$section-USER_MATRIX.csv") -Encoding UTF8
-                    }
-                    catch {
-                        LogThis -m "Failed exporting privileged user matrix" -lvl Error -ex $_
-                    }
-
-                    $summary | & $script:Export -Name $section -IsSummary
+                if ($script:PrivilegedUsers) {
+                    LogThis -m "Final PrivilegedUsers array has $($script:PrivilegedUsers.Count) objects" -lvl Debug
+                    LogThis -m "First object properties: $($script:PrivilegedUsers[0].PSObject.Properties.Name -join ', ')" -lvl Debug
+                    $script:PrivilegedUsers | & $script:Export -Name $section
+                } else {
+                    @() | & $script:Export -Name $section -NoResults
                 }
-                else {
+
+                if ($groups -or $script:PrivilegedUsers) {
+                    $orderedSummary | & $script:Export -Name $section -IsSummary
+                } else {
                     [ordered]@{ 'Status' = "No privileged accounts found" } | & $script:Export -Name $section -IsSummary
+                }
+
+                try {
+                    LogThis -m "Searching groups for MFA, VPN, SSL, Remote" -lvl Info
+                    $mfaKeywords = @('Duo', 'MFA', 'VPN', 'SSL', 'Remote', 'Admins', 'Service', 'svc', 'sync')
+                    $mfaGroups = @()
+                    $mfaGroupMembers = @()
+                    
+                    foreach ($keyword in $mfaKeywords) {
+                        try {
+                            $foundGroups = Get-ADGroup -Filter "Name -like '*$keyword*'" -Properties Description, GroupScope, GroupType -Server $script:ADDomain.PDCEmulator
+                            if ($foundGroups) {
+                                $mfaGroups += $foundGroups
+                            }
+                        } catch {
+                            LogThis -m "Error searching '$keyword': $_" -lvl Debug
+                        }
+                    }
+                    
+                    # Remove dupes
+                    $mfaGroups = $mfaGroups | Sort-Object Name -Unique
+                    LogThis -m "Total unique groups: $($mfaGroups.Count)" -lvl Info
+                    
+                    if ($mfaGroups.Count -gt 0) {
+                        foreach ($group in $mfaGroups) {
+                            try {
+                                $members = Get-ADGroupMember -Identity $group.SID -Recursive -Server $script:ADDomain.PDCEmulator
+                                
+                                foreach ($member in $members) {
+                                    $memberDetails = $null
+                                    
+                                    if ($member.objectClass -eq 'user') {
+                                        $memberDetails = Get-ADUser -Identity $member.SID -Properties LastLogonDate, PasswordLastSet, Enabled -Server $script:ADDomain.PDCEmulator
+                                    } elseif ($member.objectClass -eq 'computer') {
+                                        $memberDetails = Get-ADComputer -Identity $member.SID -Properties LastLogonDate, Enabled -Server $script:ADDomain.PDCEmulator
+                                    } elseif ($member.objectClass -eq 'group') {
+                                        $memberDetails = Get-ADGroup -Identity $member.SID -Server $script:ADDomain.PDCEmulator
+                                    }
+                                    
+                                    if ($memberDetails) {
+                                        $mfaGroupMembers += [PSCustomObject]@{
+                                            GroupName = $group.Name
+                                            GroupSID = $group.SID
+                                            GroupDescription = $group.Description
+                                            MemberName = $memberDetails.Name
+                                            MemberSamAccountName = $memberDetails.SamAccountName
+                                            MemberSID = $memberDetails.SID
+                                            MemberType = $member.objectClass
+                                            MemberEnabled = if ($null -ne $memberDetails.Enabled) { $memberDetails.Enabled } else { "" }
+                                            LastLogonDate = if ($memberDetails.LastLogonDate) { $memberDetails.LastLogonDate.ToString('MM/dd/yyyy') } else { "" }
+                                            PasswordLastSet = if ($memberDetails.PasswordLastSet) { $memberDetails.PasswordLastSet.ToString('MM/dd/yyyy') } else { "" }
+                                        }
+                                    }
+                                }
+                            } catch {
+                                LogThis -m "Error processing group $($group.Name): $_" -lvl Warn
+                            }
+                        }
+                        
+                        if ($mfaGroupMembers.Count -gt 0) {
+                            LogThis -m "Exporting $($mfaGroupMembers.Count) Group Search" -lvl Info
+                            $mfaGroupMembers | & $script:Export -Name "$section-GROUP-SEARCH"
+                            
+                            [ordered]@{
+                                'Group Search' = "(Total Groups) $($mfaGroups.Count), (Total Members) $($mfaGroupMembers.Count), (Unique Users) $(($mfaGroupMembers | Where-Object { $_.MemberType -eq 'user' } | Sort-Object MemberSamAccountName -Unique).Count), (Unique Computers) $(($mfaGroupMembers | Where-Object { $_.MemberType -eq 'computer' } | Sort-Object MemberSamAccountName -Unique).Count), (Nested Groups) $(($mfaGroupMembers | Where-Object { $_.MemberType -eq 'group' } | Sort-Object MemberSamAccountName -Unique).Count)"
+                            } | & $script:Export -Name "$section-GROUP-SEARCH" -IsSummary
+                        } else {
+                            LogThis -m "No Groups Found" -lvl Info
+                            @() | & $script:Export -Name "$section-GROUP-SEARCH" -NoResults
+                        }
+                    } else {
+                        LogThis -m "No Groups Found" -lvl Info
+                        @() | & $script:Export -Name "$section-GROUP-SEARCH" -NoResults
+                    }
+                } catch {
+                    LogThis -m "Group Search Error: $_" -lvl Error
+                    @() | & $script:Export -Name "$section-GROUP-SEARCH" -IsError
                 }
             }
 
             'USERS' = {
-                Get-ADUser -Filter * -Properties * -Server $script:ADDomain.PDCEmulator | & $script:ExportRaw
                 try {
                     $users = Get-ADUser -Filter * -Properties $script:UserProperties -Server $script:ADDomain.PDCEmulator
+                    
+                    if ($users) {
+                        $users | ForEach-Object {
+                            [PSCustomObject][ordered]@{
+                                'AdminCount' = $_.AdminCount
+                                'Created' = $_.Created
+                                'Modified' = $_.Modified
+                                'Name' = $_.Name
+                                'DisplayName' = $_.DisplayName
+                                'Description' = $_.Description
+                                'SamAccountName' = $_.SamAccountName
+                                'Enabled' = $_.Enabled
+                                'LastLogonDate' = $_.LastLogonDate
+                                'PasswordLastSet' = $_.PasswordLastSet
+                                'CannotChangePassword' = $_.CannotChangePassword
+                                'DoesNotRequirePreAuth' = $_.DoesNotRequirePreAuth
+                                'PasswordNeverExpires' = $_.PasswordNeverExpires
+                                'PasswordNotRequired' = $_.PasswordNotRequired
+                                'SID' = $_.SID
+                                'logonWorkStations' = $_.logonWorkStations
+                                'UserAccountControl' = $_.UserAccountControl
+                                'msDS-SupportedEncryptionTypes' = $_.'msDS-SupportedEncryptionTypes'
+                                'CanonicalName' = $_.CanonicalName
+                                'DistinguishedName' = $_.DistinguishedName
+                                'AccountExpirationDate' = $_.AccountExpirationDate
+                                'LastBadPasswordAttempt' = $_.LastBadPasswordAttempt
+                                'badpwdcount' = $_.badpwdcount
+                                'PasswordExpired' = $_.PasswordExpired
+                            }
+                        } | & $script:Export -Name $section
+                    } else {
+                        @() | & $script:Export -Name $section -NoResults
+                    }
+                    
                     [ordered]@{
-                        'Counts (*)' = if ($users) { "(Total) $(($users | Measure-Object).Count), (Enabled) $(($users | Where-Object {$_.Enabled} | Measure-Object).Count), (Disabled) $(($users | Where-Object {-not $_.Enabled} | Measure-Object).Count), (Stale) $(($users | Where-Object { $_.LastLogonDate -and $_.PasswordLastSet -and ((New-TimeSpan -Start $_.LastLogonDate -End $script:StartTime).TotalDays -ge $script:LogonAge) -and ((New-TimeSpan -Start $_.PasswordLastSet -End $script:StartTime).TotalDays -ge $script:PasswordAge) } | Measure-Object).Count)" } else { "(Total) $not, (Enabled) $not, (Disabled) $not, (Stale) $not" }
-                        'Passwords (*)' = if ($users) { "(NOTREQD) $(($users | Where-Object {$_.UserAccountControl -band 0x0020} | Measure-Object).Count), (CANT_CHANGE) $(($users | Where-Object {$_.UserAccountControl -band 0x0040} | Measure-Object).Count), (DONT_EXPIRE) $(($users | Where-Object {$_.UserAccountControl -band 0x10000} | Measure-Object).Count)" } else { "(NOTREQD) $not, (CANT_CHANGE) $not, (DONT_EXPIRE) $not" }
-                        'Delegation (*)' = if ($users) { "(TRUSTED) $(($users | Where-Object {$_.UserAccountControl -band 0x80000} | Measure-Object).Count), (NOT_DELEGATED) $(($users | Where-Object {$_.UserAccountControl -band 0x100000} | Measure-Object).Count)" } else { "(TRUSTED_FOR) $not, (NOT_DELEGATED) $not" }
-                        'InterdomainTrust' = if ($users) { ($users | Where-Object {$_.UserAccountControl -band 0x0800} | Measure-Object).Count } else { $not }
-                        'DesKeyOnly' = if ($users) { ($users | Where-Object {$_.UserAccountControl -band 0x200000} | Measure-Object).Count } else { $not }
-                        'NoPreAuth' = if ($users) { ($users | Where-Object {$_.UserAccountControl -band 0x400000} | Measure-Object).Count } else { $not }
+                        'Counts (*)' = if ($users) { "(Total) $(($users | Measure-Object).Count), (Enabled) $(($users | Where-Object {$_.Enabled} | Measure-Object).Count), (Disabled) $(($users | Where-Object {-not $_.Enabled} | Measure-Object).Count), (Stale) $(($users | Where-Object { $_.LastLogonDate -and $_.PasswordLastSet -and ((New-TimeSpan -Start $_.LastLogonDate -End $script:StartTime).TotalDays -ge $script:LogonAge) -and ((New-TimeSpan -Start $_.PasswordLastSet -End $script:StartTime).TotalDays -ge $script:PasswordAge) } | Measure-Object).Count), (NOTREQD) $(($users | Where-Object {$_.UserAccountControl -band 0x0020} | Measure-Object).Count), (CANT_CHANGE) $(($users | Where-Object {$_.UserAccountControl -band 0x0040} | Measure-Object).Count), (DONT_EXPIRE) $(($users | Where-Object {$_.UserAccountControl -band 0x10000} | Measure-Object).Count), (InterdomainTrust) $(($users | Where-Object {$_.UserAccountControl -band 0x0800} | Measure-Object).Count)" } else { "(Total) $notFound, (Enabled) $notFound, (Disabled) $notFound, (Stale) $notFound, (NOTREQD) $notFound, (CANT_CHANGE) $notFound, (DONT_EXPIRE) $notFound, (InterdomainTrust) $notFound" }
+                        'Passwords - Enabled Accts Only (*)' = if ($users) { "(DesKeyOnly) $(($users | Where-Object {$_.Enabled -and ($_.UserAccountControl -band 0x200000)} | Measure-Object).Count), (NoPreAuth) $(($users | Where-Object {$_.Enabled -and ($_.UserAccountControl -band 0x400000)} | Measure-Object).Count), (ReversibleEncryption) $(($users | Where-Object {$_.Enabled -and ($_.UserAccountControl -band 0x0080)} | Measure-Object).Count)" } else { "(DesKeyOnly) $notFound, (NoPreAuth) $notFound, (ReversibleEncryption) $notFound" }
+                        'Delegation (*)' = if ($users) { "(TRUSTED) $(($users | Where-Object {$_.UserAccountControl -band 0x80000} | Measure-Object).Count), (NOT_DELEGATED) $(($users | Where-Object {$_.UserAccountControl -band 0x100000} | Measure-Object).Count)" } else { "(TRUSTED_FOR) $notFound, (NOT_DELEGATED) $notFound" }
                     } | & $script:Export -Name $section -IsSummary
                 } catch {
                     LogThis -m "Failed checking users: $_" -lvl Error
+                    @() | & $script:Export -Name $section -IsError
                     [ordered]@{
-                        'Counts (*)' = $ope
-                        'Passwords (*)' = $ope
-                        'Delegation (*)' = $ope
-                        'InterdomainTrust' = $ope
-                        'DesKeyOnly' = $ope
-                        'NoPreAuth' = $ope
+                        'Counts (*)' = $errorValue
+                        'Passwords - Enabled Accts Only (*)' = $errorValue
+                        'Delegation (*)' = $errorValue
                     } | & $script:Export -Name $section -IsSummary
                 }
             }
 
             'KRBTGT' = {
-                Get-ADUser -Identity 'krbtgt' -Properties * -Server $script:ADDomain.PDCEmulator | & $script:ExportRaw
-
                 try {
                     $krbtgt = Get-ADUser 'krbtgt' -Properties PasswordLastSet -Server $script:ADDomain.PDCEmulator
+                    
+                    $passwordAge = New-TimeSpan -Start $krbtgt.PasswordLastSet -End $script:StartTime
+
                     [ordered]@{
-                        'Password' = "(LastSet) $(& $script:Format $krbtgt.PasswordLastSet -Format Display) $(Format-PartitionBackup (Get-BackupTime $krbtgt.PasswordLastSet))  [$([math]::Floor($passwordAge.TotalDays / 365))y$([math]::Floor(($passwordAge.TotalDays % 365) / 30))m$([math]::Floor($passwordAge.TotalDays % 30))d]"
+                        'PasswordLastSet' = "LastSet $(& $script:Format $krbtgt.PasswordLastSet -Format Display) [$([math]::Floor($passwordAge.TotalDays / 365))y:$([math]::Floor(($passwordAge.TotalDays % 365) / 30))m:$([math]::Floor($passwordAge.TotalDays % 30))d]"
                     } | & $script:Export -Name $section -IsSummary
                 } catch {
                     LogThis -m "Failed checking KRBTGT: $_" -lvl Error
+                    @() | & $script:Export -Name $section -IsError
                     [ordered]@{
-                        'Password' = $ope
+                        'PasswordLastSet' = $notFound
                     } | & $script:Export -Name $section -IsSummary
                 }
             }
 
             'DELEGATION' = {
-                Get-ADObject -Filter * -Properties * -Server $script:ADDomain.PDCEmulator | & $script:ExportRaw
-
                 try {
                     $delegatedAccounts = Get-ADObject -Filter {
                         ((UserAccountControl -BAND 0x0080000) -OR 
                         (UserAccountControl -BAND 0x1000000) -OR 
                         (msDS-AllowedToDelegateTo -like '*') -OR 
-                        (msDS-AllowedToActOnBehalfOfOtherIdentity -like '*')) -AND 
-                        (PrimaryGroupID -ne '516') -AND 
-                        (PrimaryGroupID -ne '521')
+                        (msDS-AllowedToActOnBehalfOfOtherIdentity -like '*'))
                     } -Properties @(
-                        "Name", "ObjectClass", "PrimaryGroupID", 
-                        "UserAccountControl", "ServicePrincipalName", 
-                        "msDS-AllowedToDelegateTo", 
-                        "msDS-AllowedToActOnBehalfOfOtherIdentity",
-                        "DistinguishedName"
+                        "Name", "SamAccountName", "ObjectClass", "UserAccountControl", 
+                        "msDS-AllowedToDelegateTo", "msDS-AllowedToActOnBehalfOfOtherIdentity", "CanonicalName"
                     ) -Server $script:ADDomain.PDCEmulator
-                    $delegatedAccounts | & $script:ExportRaw
+
                     if ($delegatedAccounts) {
                         $delegatedAccounts | ForEach-Object {
-                            $delegationType = switch ($true) {
-                                { $_.UserAccountControl -BAND 0x0080000 } { 'Unconstrained' }
-                                { $_.UserAccountControl -BAND 0x1000000 } { 'Constrained with Protocol Transition' }
-                                { $_.'msDS-AllowedToActOnBehalfOfOtherIdentity' } { 'Resource-Based Constrained Delegation' }
-                                { $_.'msDS-AllowedToDelegateTo' } { 'Constrained' }
-                                default { 'Unknown' }
+                            $delegationType = 'Constrained'  # Default
+                            
+                            if ($_.UserAccountControl -BAND 0x0080000) {
+                                $delegationType = 'Unconstrained'
+                            }
+                            
+                            if ($_.UserAccountControl -BAND 0x1000000) {
+                                $delegationType = 'Constrained with Protocol Transition'
+                            }
+                            
+                            if ($_.'msDS-AllowedToActOnBehalfOfOtherIdentity' -and $_.'msDS-AllowedToActOnBehalfOfOtherIdentity' -ne '') {
+                                $delegationType = 'Resource-Based Constrained Delegation'
                             }
 
                             [PSCustomObject][ordered]@{
-                                'Default' = "(Name) $($_.Name), (Type) $delegationType"
-                                'Services' = if ($_.UserAccountControl -BAND 0x0080000) { "All" } else { "Specific" }
-                                'Protocol' = if ($_.UserAccountControl -BAND 0x1000000) { "Any" } else { "Kerberos" }
-                                'Domain' = $script:ADDomain.DNSRoot
-                            } | & $script:Export -Name $section
-                        }
+                                'Name' = $_.Name
+                                'SamAccountName' = $_.SamAccountName
+                                'ObjectClass' = $_.ObjectClass
+                                'DelegationType' = $delegationType
+                                'msDS-AllowedToDelegateTo' = $_.'msDS-AllowedToDelegateTo' -join ', '
+                                'msDS-AllowedToActOnBehalfOfOtherIdentity' = $_.'msDS-AllowedToActOnBehalfOfOtherIdentity' -join ', '
+                                'UserAccountControl' = $_.UserAccountControl
+                                'CanonicalName' = $_.CanonicalName
+                                'DistinguishedName' = $_.DistinguishedName
+                            }
+                        } | & $script:Export -Name $section
 
                         [ordered]@{
                             'Summary (+)' = "(Total) $($delegatedAccounts.Count), (Unconstrained) $(($delegatedAccounts | Where-Object { $_.UserAccountControl -BAND 0x0080000 }).Count), (Constrained) $(($delegatedAccounts | Where-Object { $_.'msDS-AllowedToDelegateTo' }).Count), (Resource) $(($delegatedAccounts | Where-Object { $_.'msDS-AllowedToActOnBehalfOfOtherIdentity' }).Count)"
                         } | & $script:Export -Name $section -IsSummary
                     } else {
+                        @() | & $script:Export -Name $section -NoResults
                         [ordered]@{
-                            'Summary (+)' = "(Total) $not, (Unconstrained) $not, (Constrained) $not, (Resource) $not"
+                            'Summary (+)' = "(Total) $notFound, (Unconstrained) $notFound, (Constrained) $notFound, (Resource) $notFound"
                         } | & $script:Export -Name $section -IsSummary
                     }
                 } catch {
                     LogThis -m "Failed checking delegation: $_" -lvl Error
+                    @() | & $script:Export -Name $section -IsError
                     [ordered]@{
-                        'Summary (+)' = "(Total) $ope, (Unconstrained) $ope, (Constrained) $ope, (Resource) $ope"
+                        'Summary (+)' = "(Total) $errorValue, (Unconstrained) $errorValue, (Constrained) $errorValue, (Resource) $errorValue"
                     } | & $script:Export -Name $section -IsSummary
                 }
             }
 
             'MSA' = {
-                Get-ADObject -LDAPFilter "(|(objectClass=msDS-ManagedServiceAccount)(objectClass=msDS-GroupManagedServiceAccount))" -Properties * -Server $script:ADDomain.PDCEmulator | & $script:ExportRaw
                 try {
-                    $sMSA = Get-ADObject -Filter 'ObjectClass -eq "msDS-ManagedServiceAccount"' `
-                        -Properties Name, ObjectClass, SamAccountName, Created, Modified, Description, DNSHostName, Enabled, MemberOf, 'msDS-HostServiceAccount' `
-                        -Server $script:ADDomain.PDCEmulator
+                    $props = @(
+                        'PrincipalsAllowedToRetrieveManagedPassword',
+                        'DNSHostName','Enabled','CanonicalName','Description','DisplayName',
+                        'DistinguishedName','Created','Modified','msDS-ManagedPasswordInterval',
+                        'msDS-SupportedEncryptionTypes','Name','SamAccountName','userAccountControl'
+                    )
+                    $msaList = Get-ADServiceAccount -Filter * -Properties $props -Server $script:ADDomain.PDCEmulator
 
-                    $gMSA = Get-ADObject -Filter 'ObjectClass -eq "msDS-GroupManagedServiceAccount"' `
-                        -Properties Name, ObjectClass, SamAccountName, Created, Modified, Description, DNSHostName, Enabled, MemberOf, 'msDS-GroupMSAMembership' `
-                        -Server $script:ADDomain.PDCEmulator
-
-                    if ($sMSA -or $gMSA) {
-                        $sMSA | ForEach-Object {
-                            [PSCustomObject][ordered]@{
-                                'Default' = "(Name) $($_.Name), (Type) sMSA, (Enabled) $($_.Enabled)"
-                                'Created' = "$(& $script:Format $_.Created -Format Display) $(Format-PartitionBackup (Get-BackupTime $_.Created))"
-                                'Modified' = "$(& $script:Format $_.Modified -Format Display) $(Format-PartitionBackup (Get-BackupTime $_.Modified))"
-                                'Hostname (+)' = if ($_.DNSHostName) { $_.DNSHostName } else { $nul }
-                                'Computers (+)' = if ($_.'msDS-HostServiceAccount') { 
-                                    (($_.'msDS-HostServiceAccount' | ForEach-Object { try { (Get-ADComputer $_ -Server $script:ADDomain.PDCEmulator).Name } catch { $null } }) -join ', ') 
-                                } else { 
-                                    $nul 
-                                }
-                                'Groups (+)' = if ($_.MemberOf) { 
-                                    (($_.MemberOf | ForEach-Object { try { (Get-ADGroup $_ -Server $script:ADDomain.PDCEmulator).Name } catch { $null } }) -join ', ') 
-                                } else { 
-                                    $nul 
-                                }
-                            } | & $script:Export -Name $section
+                    $msaList | ForEach-Object {
+                        [PSCustomObject][ordered]@{
+                            Type                  = if ($_.ObjectClass -eq 'msDS-GroupManagedServiceAccount') { 'gMSA' } else { 'sMSA' }
+                            Created               = $_.Created
+                            Modified              = $_.Modified
+                            Name                  = $_.Name
+                            SamAccountName        = $_.SamAccountName
+                            Enabled               = $_.Enabled
+                            DNSHostName           = $_.DNSHostName
+                            Description           = $_.Description
+                            msDS_ManagedPasswordInterval  = $_.'msDS-ManagedPasswordInterval'
+                            msDS_SupportedEncryptionTypes = $_.'msDS-SupportedEncryptionTypes'
+                            userAccountControl    = $_.userAccountControl
+                            CanonicalName         = $_.CanonicalName
+                            DistinguishedName     = $_.DistinguishedName
                         }
+                    } | & $script:Export -Name $section
 
-                        $gMSA | ForEach-Object {
-                            [PSCustomObject][ordered]@{
-                                'Default' = "(Name) $($_.Name), (Type) gMSA, (Enabled) $($_.Enabled)"
-                                'Created' = "$(& $script:Format $_.Created -Format Display) $(Format-PartitionBackup (Get-BackupTime $_.Created))"
-                                'Modified' = "$(& $script:Format $_.Modified -Format Display) $(Format-PartitionBackup (Get-BackupTime $_.Modified))"
-                                'Hostname (+)' = if ($_.DNSHostName) { $_.DNSHostName } else { $nul }
-                                'Principals (+)' = if ($_.'msDS-GroupMSAMembership') { 
-                                    (($_.'msDS-GroupMSAMembership' | ForEach-Object { try { (Get-ADObject $_ -Server $script:ADDomain.PDCEmulator).Name } catch { $null } }) -join ', ') 
-                                } else { 
-                                    $nul 
+                    $allMembers = @{}
+                    $gmsaGroupNames = $msaList | Where-Object ObjectClass -eq 'msDS-GroupManagedServiceAccount' | Select-Object -ExpandProperty Name | Sort-Object -Unique
+                    $msaList | Where-Object ObjectClass -eq 'msDS-GroupManagedServiceAccount' | ForEach-Object {
+                        $msa = $_
+                        foreach ($principal in $msa.PrincipalsAllowedToRetrieveManagedPassword) {
+                            $dn = if ($principal -is [string]) { $principal } else { $principal.DistinguishedName }
+                            $visited = @{}
+                            $stack = @(@{DN=$dn;Path=@()})
+                            $results = @()
+                            while ($stack.Count -gt 0) {
+                                $current = $stack[0]
+                                if ($stack.Count -gt 1) {
+                                    $stack = $stack[1..($stack.Count-1)]
+                                } else {
+                                    $stack = @()
                                 }
-                                'Groups (+)' = if ($_.MemberOf) { 
-                                    (($_.MemberOf | ForEach-Object { try { (Get-ADGroup $_ -Server $script:ADDomain.PDCEmulator).Name } catch { $null } }) -join ', ') 
-                                } else { 
-                                    $nul 
+                                if ($visited.ContainsKey($current.DN)) { continue }
+                                $visited[$current.DN] = $true
+                                $members = Get-ADGroupMember -Identity $current.DN
+                                foreach ($m in $members) {
+                                    if ($m.objectClass -eq 'user' -or $m.objectClass -eq 'computer') {
+
+                                        $fullObject = if ($m.objectClass -eq 'user') {
+                                            Get-ADUser -Identity $m.DistinguishedName -Properties Enabled -Server $script:ADDomain.PDCEmulator
+                                        } else {
+                                            Get-ADComputer -Identity $m.DistinguishedName -Properties Enabled -Server $script:ADDomain.PDCEmulator
+                                        }
+                                        $results += [PSCustomObject]@{
+                                            Member = $fullObject
+                                            Path = @($current.Path + $m.Name)
+                                        }
+                                    } elseif ($m.objectClass -eq 'group') {
+                                        if (-not $visited.ContainsKey($m.DistinguishedName)) {
+                                            $stack += @{DN=$m.DistinguishedName;Path=@($current.Path + $m.Name)}
+                                        }
+                                    }
                                 }
-                            } | & $script:Export -Name $section
+                            }
+                            LogThis -m "Found $($results.Count) members for $($msa.Name)" -lvl Debug
+                            foreach ($entry in $results) {
+                                $member = $entry.Member
+                                $pathArr = $entry.Path
+                                $key = "$($member.SamAccountName)|$($member.objectClass)"
+                                if (-not $allMembers.ContainsKey($key)) {
+                                    $allMembers[$key] = @{
+                                        SamAccountName = $member.SamAccountName
+                                        ObjectType     = $member.objectClass
+                                        Enabled        = $member.Enabled
+                                    }
+                                }
+                                $pathStr = if ($pathArr.Count -eq 0) { 'Direct member' } else { ($pathArr -join ' <- ') }
+                                $allMembers[$key][$msa.Name] = $pathStr
+                            }
                         }
-
-                        [ordered]@{
-                            'Summary (+)' = "(Total) $(($sMSA + $gMSA).Count), (sMSA) $(($sMSA | Measure-Object).Count), (gMSA) $(($gMSA | Measure-Object).Count)"
-                        } | & $script:Export -Name $section -IsSummary
-                    } else {
-                        [ordered]@{
-                            'Summary (+)' = "(Total) $not, (sMSA) $not, (gMSA) $not"
-                        } | & $script:Export -Name $section -IsSummary
                     }
-                } catch {
+                    $matrix = @()
+                    foreach ($entry in $allMembers.Values) {
+                        $row = [ordered]@{
+                            SamAccountName = $entry.SamAccountName
+                            ObjectType     = $entry.ObjectType
+                            Enabled        = $entry.Enabled
+                        }
+                        foreach ($gmsaGroup in $gmsaGroupNames) {
+                            $row["MSA=$gmsaGroup"] = if ($entry.ContainsKey($gmsaGroup)) { $entry[$gmsaGroup] } else { '' }
+                        }
+                        $matrix += [PSCustomObject]$row
+                    }
+                    if ($matrix.Count) {
+                        $matrix | & $script:Export -Name "$section-GROUPS"
+                    } else {
+                        @() | & $script:Export -Name "$section-GROUPS" -NoResults
+                    }
+                    $count_s = ($msaList | Where-Object ObjectClass -eq 'msDS-ManagedServiceAccount').Count
+                    $count_g = ($msaList | Where-Object ObjectClass -eq 'msDS-GroupManagedServiceAccount').Count
+                    [ordered]@{
+                        'Summary (+)' = "(Total) $($msaList.Count), (sMSA) $count_s, (gMSA) $count_g, (GroupMembers) $($matrix.Count)"
+                    } | & $script:Export -Name $section -IsSummary
+                }
+                catch {
                     LogThis -m "Failed checking MSAs: $_" -lvl Error
                     [ordered]@{
-                        'Summary (+)' = "(Total) $ope, (sMSA) $ope, (gMSA) $ope"
+                        'Summary (+)' = "(Total) $errorValue, (sMSA) $errorValue, (gMSA) $errorValue"
                     } | & $script:Export -Name $section -IsSummary
                 }
             }
 
             'SPN' = {
-                Get-ADObject -Filter { ServicePrincipalName -like "*" } -Properties * -Server $script:ADDomain.PDCEmulator | & $script:ExportRaw
                 try {
                     $spnObjects = Get-ADObject -Filter { ServicePrincipalName -like "*" } `
-                        -Properties ServicePrincipalName, ObjectClass, Name, DistinguishedName, SamAccountName, UserAccountControl `
-                        -Server $script:ADDomain.PDCEmulator
-
-                    $spnObjects | & $script:ExportRaw
-
-                    $totalSPNs = 0
-                    $totalObjects = 0
-                    $totalUsers = 0
-                    $totalPrivileged = 0
-                    $totalDuplicates = 0
-
+                        -Properties ServicePrincipalName, ObjectClass, Name, DistinguishedName, SamAccountName, UserAccountControl, CanonicalName, Enabled `
+                        -Server $script:ADDomain.PDCEmulator | Where-Object { $_.ObjectClass -eq "user" }
+                    
                     if ($spnObjects) {
                         $userSPNs = $spnObjects | Where-Object { $_.ObjectClass -eq 'user' }
                         $totalUsers = ($userSPNs | Measure-Object).Count
-                        if ($userSPNs) {
-                            $userSPNs | ForEach-Object {
-                                [PSCustomObject][ordered]@{
-                                    'Default' = "(Name) $($_.Name), (SamAccountName) $($_.SamAccountName)"
-                                    'SPNs (+)' = $_.ServicePrincipalName -join ', '
-                                } | & $script:Export -Name "$section-STANDALONE"
-                            }
-                        }
 
                         $privilegedSPNs = $spnObjects | Where-Object {
                             $_.ObjectClass -eq 'user' -and
                             $_.SamAccountName -in $script:PrivilegedUsers.SamAccountName
                         }
                         $totalPrivileged = ($privilegedSPNs | Measure-Object).Count
-                        if ($privilegedSPNs) {
-                            $privilegedSPNs | ForEach-Object {
-                                [PSCustomObject][ordered]@{
-                                    'Default' = "(Name) $($_.Name), (SamAccountName) $($_.SamAccountName)"
-                                    'SPNs (+)' = $_.ServicePrincipalName -join ', '
-                                } | & $script:Export -Name "$section-PRIVILEGED"
+
+                        $allSPNs = @()
+                        foreach ($obj in $spnObjects) {
+                            foreach ($spn in $obj.ServicePrincipalName) {
+                                $allSPNs += $spn
                             }
                         }
-
-                        $spnCheck = SetSPN -X -F
-                        $duplicates = $spnCheck | Where-Object { 
-                            $_ -notlike "Checking forest*" -and 
-                            $_ -notlike "Operation will be*" -and 
-                            $_ -notlike "Processing entry*" -and
-                            $_ -notlike "found * group of duplicate SPNs*"
-                        }
-                        $totalDuplicates = ($duplicates | Measure-Object).Count
-                        if ($duplicates) {
-                            foreach ($dupe in $duplicates) {
-                                [PSCustomObject][ordered]@{
-                                    'Duplicate' = $dupe
-                                } | & $script:Export -Name "$section-DUPLICATE"
+                        
+                        $duplicateSPNs = $allSPNs | Group-Object | Where-Object { $_.Count -gt 1 } | Select-Object -ExpandProperty Name
+                        $combinedSPNData = $spnObjects | ForEach-Object {
+                            $isPrivileged = $_.SamAccountName -in $script:PrivilegedUsers.SamAccountName
+                            $hasDuplicates = $false
+                            foreach ($spn in $_.ServicePrincipalName) {
+                                if ($spn -in $duplicateSPNs) {
+                                    $hasDuplicates = $true
+                                    break
+                                }
+                            }
+                            $user = Get-ADUser -Identity $_.SamAccountName -Properties Enabled -Server $script:ADDomain.PDCEmulator
+                            [PSCustomObject][ordered]@{
+                                'Name' = $_.Name
+                                'SamAccountName' = $_.SamAccountName
+                                'ObjectType' = $_.ObjectClass
+                                'Enabled' = $user.Enabled
+                                'Privileged' = if ($isPrivileged) { 'TRUE' } else { 'FALSE' }
+                                'ServicePrincipalName' = $_.ServicePrincipalName -join ', '
+                                'Duplicate' = if ($hasDuplicates) { 'TRUE' } else { 'FALSE' }
+                                'UserAccountControl' = $_.UserAccountControl
+                                'CanonicalName' = $_.CanonicalName
+                                'DistinguishedName' = $_.DistinguishedName
                             }
                         }
-
+                        $combinedSPNData | & $script:Export -Name $section
+                        
                         $totalSPNs = ($spnObjects | ForEach-Object { $_.ServicePrincipalName.Count } | Measure-Object -Sum).Sum
                         $totalObjects = ($spnObjects | Measure-Object).Count
+                        $totalDuplicates = ($duplicateSPNs | Measure-Object).Count
+                    } else {
+                        @() | & $script:Export -Name $section -NoResults
+                        $totalSPNs = 0
+                        $totalObjects = 0
+                        $totalUsers = 0
+                        $totalPrivileged = 0
+                        $totalDuplicates = 0
                     }
 
                     [ordered]@{
@@ -951,96 +1482,162 @@ function Get-Controls {
 
                 } catch {
                     LogThis -m "Failed checking SPNs: $_" -lvl Error
+                    @() | & $script:Export -Name $section -IsError
                     [ordered]@{
-                        'Summary (+)' = "(Total) $ope, (Objects) $ope, (Users) $ope, (Privileged) $ope, (Duplicates) $ope"
+                        'Summary (+)' = "(Total) $errorValue, (Objects) $errorValue, (Users) $errorValue, (Privileged) $errorValue, (Duplicates) $errorValue"
                     } | & $script:Export -Name $section -IsSummary
                 }
             }
 
             'FGPP' = {
-             Get-ADFineGrainedPasswordPolicy -Filter * -Properties * -Server $script:ADDomain.PDCEmulator | & $script:ExportRaw
-               try {
-                    $fgpp = Get-ADFineGrainedPasswordPolicy -Filter * -Server $script:ADDomain.PDCEmulator
-                    $fgpp | & $script:ExportRaw
-
-                    if ($fgpp) {
-                        $totalPolicies = ($fgpp | Measure-Object).Count
-
-                        $fgpp | ForEach-Object {
-                            $policy = $_
-                            
-                            try {
-                                $subjects = Get-ADFineGrainedPasswordPolicySubject -Identity $policy -Server $script:ADDomain.PDCEmulator -ErrorAction Stop
-                            }
-                            catch {
-                                LogThis -m "Failed getting subjects for policy $($policy.Name): $_" -lvl Warn
-                                $subjects = @()
-                            }
-                            
-                            $allMembers = @()
-                            foreach ($subject in $subjects) {
-                                try {
-                                    $members = & $script:Recursive -GroupSID $subject.SID `
-                                                                    -GroupName $subject.Name `
-                                                                    -SecurityGroup $subject.Name `
-                                                                    -AccessPaths @{}
-                                    $allMembers += $members
-                                }
-                                catch {
-                                    LogThis -m "Failed getting members for $($subject.Name): $_" -lvl Warn
-                                }
-                            }
-                            
-                            $uniqueUsers = $allMembers | Where-Object { $_.ObjectType -eq 'User' } | Select-Object -ExpandProperty Name -Unique
-                            $uniqueGroups = $allMembers | Where-Object { $_.ObjectType -eq 'Group' } | Select-Object -ExpandProperty Name -Unique
-
-                            # Create a raw (ungrouped) detailed object with separate columns
+                try {
+                    $fgpps = Get-ADFineGrainedPasswordPolicy -Filter * -Server $script:ADDomain.PDCEmulator
+                    
+                    if ($fgpps) {
+                        $fgpps | ForEach-Object {
+                            $appliedTo = (Get-ADFineGrainedPasswordPolicySubject -Identity $_.Name -Server $script:ADDomain.PDCEmulator)
+                            $users = @($appliedTo | Where-Object { $_.objectClass -eq 'user' })
+                            $groups = @($appliedTo | Where-Object { $_.objectClass -eq 'group' })
                             [PSCustomObject][ordered]@{
-                                Name                     = $policy.Name
-                                Precedence               = $policy.Precedence
-                                MinPasswordLength        = $policy.MinPasswordLength
-                                PasswordHistoryCount     = $policy.PasswordHistoryCount
-                                ComplexityEnabled        = $policy.ComplexityEnabled
-                                ReversibleEncryption     = $policy.ReversibleEncryptionEnabled
-                                MinPasswordAge           = $policy.MinPasswordAge
-                                MaxPasswordAge           = $policy.MaxPasswordAge
-                                LockoutThreshold         = $policy.LockoutThreshold
-                                LockoutDuration          = $policy.LockoutDuration
-                                LockoutObservationWindow = $policy.LockoutObservationWindow
-                                AppliedTo                = if ($subjects) { ($subjects | Select-Object -ExpandProperty Name | Sort-Object) -join ', ' } else { $null }
-                                AffectedUsers            = if ($uniqueUsers) { ($uniqueUsers | Sort-Object) -join ', ' } else { $null }
-                                AffectedGroups           = if ($uniqueGroups) { ($uniqueGroups | Sort-Object) -join ', ' } else { $null }
-                            } | & $script:Export -Name $section
-                        }
+                                'Name'                     = $_.Name
+                                'Precedence'               = $_.Precedence
+                                'MinPasswordLength'        = $_.MinPasswordLength
+                                'PasswordHistoryCount'     = $_.PasswordHistoryCount
+                                'ComplexityEnabled'        = $_.ComplexityEnabled
+                                'ReversibleEncryptionEnabled' = $_.ReversibleEncryptionEnabled
+                                'MinPasswordAge'           = $_.MinPasswordAge
+                                'MaxPasswordAge'           = $_.MaxPasswordAge
+                                'LockoutThreshold'         = $_.LockoutThreshold
+                                'LockoutDuration'          = $_.LockoutDuration
+                                'LockoutObservationWindow' = $_.LockoutObservationWindow
+                                'AppliedTo'                = ($appliedTo.Name -join ', ')
+                                'AffectedUsers'            = ($users.Name -join ', ')
+                                'AffectedGroups'           = ($groups.Name -join ', ')
+                            }
+                        } | & $script:Export -Name $section
+                    } else {
+                        @() | & $script:Export -Name $section -NoResults
                     }
 
-                    [ordered]@{
-                        'Summary (+)' = "(Total) $totalPolicies"
-                    } | & $script:Export -Name $section -IsSummary
+                    $allMembers = @{}
+                    $fgppNames = $fgpps | Select-Object -ExpandProperty Name | Sort-Object -Unique
+                    
+                    foreach ($fgpp in $fgpps) {
+                        $appliedTo = (Get-ADFineGrainedPasswordPolicySubject -Identity $fgpp.Name -Server $script:ADDomain.PDCEmulator)
+                        $groups = @($appliedTo | Where-Object { $_.objectClass -eq 'group' })
+                        $users = @($appliedTo | Where-Object { $_.objectClass -eq 'user' })
 
-                }
-                catch {
-                    LogThis -m "Failed checking FGPPs: $_" -lvl Error
+                        foreach ($user in $users) {
+                            $fullObject = Get-ADUser -Identity $user.DistinguishedName -Properties Enabled -Server $script:ADDomain.PDCEmulator
+                            $key = "$($fullObject.SamAccountName)|$($fullObject.objectClass)"
+                            if (-not $allMembers.ContainsKey($key)) {
+                                $allMembers[$key] = @{
+                                    SamAccountName = $fullObject.SamAccountName
+                                    ObjectType     = $fullObject.objectClass
+                                    Enabled        = $fullObject.Enabled
+                                }
+                            }
+                            $allMembers[$key][$fgpp.Name] = 'Direct member'
+                        }
+
+                        foreach ($group in $groups) {
+                            $visited = @{}
+                            $stack = @(@{DN=$group.DistinguishedName;Path=@($group.Name)})
+                            $results = @()
+                            while ($stack.Count -gt 0) {
+                                $current = $stack[0]
+                                if ($stack.Count -gt 1) {
+                                    $stack = $stack[1..($stack.Count-1)]
+                                } else {
+                                    $stack = @()
+                                }
+                                if ($visited.ContainsKey($current.DN)) { continue }
+                                $visited[$current.DN] = $true
+                                $members = Get-ADGroupMember -Identity $current.DN
+                                foreach ($m in $members) {
+                                    if ($m.objectClass -eq 'user' -or $m.objectClass -eq 'computer') {
+                                        $fullObject = if ($m.objectClass -eq 'user') {
+                                            Get-ADUser -Identity $m.DistinguishedName -Properties Enabled -Server $script:ADDomain.PDCEmulator
+                                        } else {
+                                            Get-ADComputer -Identity $m.DistinguishedName -Properties Enabled -Server $script:ADDomain.PDCEmulator
+                                        }
+                                        $results += [PSCustomObject]@{
+                                            Member = $fullObject
+                                            Path = @($current.Path + $m.Name)
+                                        }
+                                    } elseif ($m.objectClass -eq 'group') {
+                                        if (-not $visited.ContainsKey($m.DistinguishedName)) {
+                                            $stack += @{DN=$m.DistinguishedName;Path=@($current.Path + $m.Name)}
+                                        }
+                                    }
+                                }
+                            }
+                            LogThis -m "Found $($results.Count) members for FGPP $($fgpp.Name) group $($group.Name)" -lvl Debug
+                            foreach ($entry in $results) {
+                                $member = $entry.Member
+                                $pathArr = $entry.Path
+                                $key = "$($member.SamAccountName)|$($member.objectClass)"
+                                if (-not $allMembers.ContainsKey($key)) {
+                                    $allMembers[$key] = @{
+                                        SamAccountName = $member.SamAccountName
+                                        ObjectType     = $member.objectClass
+                                        Enabled        = $member.Enabled
+                                    }
+                                }
+                                $pathStr = if ($pathArr.Count -eq 1) { 'Direct member' } else { ($pathArr -join ' <- ') }
+                                if (-not $allMembers[$key][$fgpp.Name] -or $allMembers[$key][$fgpp.Name] -ne 'Direct member') {
+                                    $allMembers[$key][$fgpp.Name] = $pathStr
+                                }
+                            }
+                        }
+                    }
+                    
+                    $matrix = @()
+                    foreach ($entry in $allMembers.Values) {
+                        $row = [ordered]@{
+                            SamAccountName = $entry.SamAccountName
+                            ObjectType     = $entry.ObjectType
+                            Enabled        = $entry.Enabled
+                            Privileged     = if ($entry.SamAccountName -in $script:PrivilegedUsers.SamAccountName) { 'TRUE' } else { 'FALSE' }
+                        }
+                        foreach ($fgppName in $fgppNames) {
+                            $row["FGPP=$fgppName"] = if ($entry.ContainsKey($fgppName)) { $entry[$fgppName] } else { '' }
+                        }
+                        $matrix += [PSCustomObject]$row
+                    }
+                    
+                    if ($matrix.Count) {
+                        $matrix | & $script:Export -Name "$section-GROUPS"
+                    } else {
+                        @() | & $script:Export -Name "$section-GROUPS" -NoResults
+                    }
+                    
                     [ordered]@{
-                        'Summary (+)' = "(Total) $ope"
+                        'Summary (+)' = "(Total) $(if ($fgpps) { $fgpps.Count } else { 0 }), (GroupMembers) $($matrix.Count)"
+                    } | & $script:Export -Name $section -IsSummary
+                } catch {
+                    LogThis -m "Failed checking FGPP: $_" -lvl Error
+                    @() | & $script:Export -Name $section -IsError
+                    [ordered]@{
+                        'Summary (+)' = "(Total) $errorValue, (GroupMembers) $errorValue"
                     } | & $script:Export -Name $section -IsSummary
                 }
             }
 
             'SYSVOL' = {
-                $script:DCs | ForEach-Object { Get-ChildItem -Path "\\$($_.Name)\SYSVOL" -Recurse -Depth 2 } | & $script:ExportRaw
                 try {
                     $results = foreach ($dc in $script:DCs) {
                         LogThis -m "Processing SYSVOL on $($dc.Name)"
                         try {
-                            # Recursively enumerate folders within SYSVOL up to a depth of 2
                             $allFolders = Get-ChildItem -Path "\\$($dc.Name)\SYSVOL" -Directory -Recurse -Depth 2
                             foreach ($folder in $allFolders) {
                                 $acl = Get-Acl -Path $folder.FullName
-                                # For each access entry that isn't one of the standard ones, output a clean object
                                 $acl.Access | Where-Object { 
-                                    @("BUILTIN\Administrators", "NT AUTHORITY\SYSTEM", "CREATOR OWNER") -notcontains $_.IdentityReference -and 
-                                    $_.FileSystemRights -notmatch "^-?[\d\.]+$" 
+                                    $_.IdentityReference -notlike "NT AUTHORITY*" -and
+                                    $_.IdentityReference -notlike "BUILTIN*" -and
+                                    $_.IdentityReference -notlike "CREATOR*" -and
+                                    $_.IdentityReference -notmatch "^S-1-" -and
+                                    $_.FileSystemRights -ne "ReadAndExecute, Synchronize"
                                 } | ForEach-Object {
                                     [PSCustomObject][ordered]@{
                                         DC          = $dc.Name
@@ -1051,28 +1648,22 @@ function Get-Controls {
                                     }
                                 }
                             }
-
-                            
                         } catch {
                             LogThis -m "Failed to process DC: $($dc.Name)" -lvl Warn -ex $_
                             continue
                         }
                     }
-
+                    
                     if ($results) {
-                        # Detailed export: raw dump of each SYSVOL access entry
                         $results | & $script:Export -Name $section
-                        
-                        # Also export a summary with a clean PSCustomObject
-                        [PSCustomObject][ordered]@{
-                            'DCs Processed'      = ($script:DCs | Measure-Object).Count
-                            'Custom Permissions' = ($results | Measure-Object).Count
-                        } | & $script:Export -Name $section -IsSummary
+                        [PSCustomObject]                    [ordered]@{
+                        'Summary (+)' = "(DCs Processed) $(($script:DCs | Measure-Object).Count), (Custom Permissions) $(($results | Measure-Object).Count)"
+                    } | & $script:Export -Name $section -IsSummary
                     } else {
-                        [PSCustomObject][ordered]@{
-                            'DCs Processed'      = ($script:DCs).Count
-                            'Custom Permissions' = 0
-                        } | & $script:Export -Name $section -IsSummary
+                        @() | & $script:Export -Name $section -NoResults
+                        [PSCustomObject]                    [ordered]@{
+                        'Summary (+)' = "(DCs Processed) $(($script:DCs).Count), (Custom Permissions) 0"
+                    } | & $script:Export -Name $section -IsSummary
                     }
                 } catch {
                     & $script:Error $section "Failed gathering $section"
@@ -1080,6 +1671,52 @@ function Get-Controls {
             }
 
             'LOGGING' = {
+                & {
+                    $dll = [string]::Join("`r`n", '[DllImport("advapi32.dll")]', 'public static extern bool') 
+                    $auditpol = Add-Type -Name 'AuditPolRaw' -Namespace 'Win32' -PassThru -MemberDefinition "
+                        $dll AuditEnumerateCategories(out IntPtr catList, out uint count);
+                        $dll AuditLookupCategoryName(Guid catGuid, out string catName);
+                        $dll AuditEnumerateSubCategories(Guid catGuid, bool all, out IntPtr subList, out uint count);
+                        $dll AuditLookupSubCategoryName(Guid subGuid, out String subName);
+                        $dll AuditQuerySystemPolicy(Guid subGuid, uint count, out IntPtr policy);
+                        $dll AuditFree(IntPtr buffer);"
+
+                    Add-Type -TypeDefinition "
+                        using System;
+                        public struct AUDIT_POLICY_INFORMATION {
+                            public Guid AuditSubCategoryGuid;
+                            public UInt32 AuditingInformation;
+                            public Guid AuditCategoryGuid;
+                        }"
+
+                    $ms = [System.Runtime.InteropServices.Marshal]
+                    $count = [uint32]0
+                    $buffer = [IntPtr]::Zero
+                    $size = $ms::SizeOf([type][guid])
+                    $null = $auditpol::AuditEnumerateSubCategories([guid]::Empty, $true, [ref]$buffer, [ref]$count)
+                    $ptr = [int64]$buffer
+                    $results = @()
+
+                    foreach ($id in 1..$count) {
+                        $guid = $ms::PtrToStructure([IntPtr]$ptr,[type][guid])
+                        $ptr += $size
+
+                        $pol = New-Object AUDIT_POLICY_INFORMATION
+                        $pSize = $ms::SizeOf($pol)
+                        $pPtr = $ms::AllocHGlobal($pSize)
+                        $null = $ms::StructureToPtr($pol, $pPtr, $false)
+                        $null = $auditpol::AuditQuerySystemPolicy($guid, 1, [ref]$pPtr)
+                        $pol = $ms::PtrToStructure($pPtr, [type][AUDIT_POLICY_INFORMATION])
+                        $null = $ms::FreeHGlobal($pPtr)
+
+                        $results += $pol
+                    }
+
+                    $null = $auditpol::AuditFree($buffer)
+                    $results | & $script:Export -Name $section
+
+                }
+                
                 try {
                     $dll = [string]::Join("`r`n", '[DllImport("advapi32.dll")]', 'public static extern bool') 
                     $auditpol = Add-Type -Name 'AuditPol' -Namespace 'Win32' -PassThru -MemberDefinition "
@@ -1099,21 +1736,27 @@ function Get-Controls {
                         }"
 
                     function Get-PolicyInfo($sub) {
-                        $pol = new-object AUDIT_POLICY_INFORMATION
-                        $size = $ms::SizeOf($pol)
-                        $ptr = $ms::AllocHGlobal($size)
-                        $null = $ms::StructureToPtr($pol, $ptr, $false)
-                        $null = $auditpol::AuditQuerySystemPolicy($sub, 1, [ref]$ptr)
-                        $pol = $ms::PtrToStructure($ptr, [type][AUDIT_POLICY_INFORMATION])
-
-                        $pol | & $script:ExportRaw
-                        $guid | & $script:ExportRaw
-
-                        $null = $ms::FreeHGlobal($ptr)
-                        @{
-                            category = $pol.AuditCategoryGuid
-                            success = [bool]($pol.AuditingInformation -band 1)
-                            failure = [bool]($pol.AuditingInformation -band 2)
+                        try {
+                            $pol = new-object AUDIT_POLICY_INFORMATION
+                            $size = $ms::SizeOf($pol)
+                            $ptr = $ms::AllocHGlobal($size)
+                            $null = $ms::StructureToPtr($pol, $ptr, $false)
+                            $result = $auditpol::AuditQuerySystemPolicy($sub, 1, [ref]$ptr)
+                            if (-not $result) {
+                                LogThis -m "AuditQuerySystemPolicy failed for GUID: $sub" -lvl Debug
+                                $null = $ms::FreeHGlobal($ptr)
+                                return $null
+                            }
+                            $pol = $ms::PtrToStructure($ptr, [type][AUDIT_POLICY_INFORMATION])
+                            $null = $ms::FreeHGlobal($ptr)
+                            @{
+                                category = $pol.AuditCategoryGuid
+                                success = [bool]($pol.AuditingInformation -band 1)
+                                failure = [bool]($pol.AuditingInformation -band 2)
+                            }
+                        } catch {
+                            LogThis -m "Get-PolicyInfo failed for GUID: $sub - $($_.Exception.Message)" -lvl Debug
+                            return $null
                         }
                     }
 
@@ -1138,118 +1781,216 @@ function Get-Controls {
                     $ptr = [int64]$buffer
                     $results = @()
                     foreach($id in 1..$count) {
-                        $guid = $ms::PtrToStructure([IntPtr]$ptr,[type][guid])
-                        $null = $auditpol::AuditLookupSubCategoryName($guid,[ref]$name)
-                        $pol = Get-PolicyInfo $guid
-                        
-                        $results += @{
-                            Category = $catList[$pol.category]
-                            Subcategory = $name.ToString()
-                            Success = $pol.success
-                            Failure = $pol.failure
+                        try {
+                            $guid = $ms::PtrToStructure([IntPtr]$ptr,[type][guid])
+                            $nameResult = $auditpol::AuditLookupSubCategoryName($guid,[ref]$name)
+                            if (-not $nameResult) {
+                                LogThis -m "AuditLookupSubCategoryName failed for GUID: $guid" -lvl Debug
+                                $ptr += $size
+                                continue
+                            }
+                            
+                            $pol = Get-PolicyInfo $guid
+                            if ($null -eq $pol) {
+                                LogThis -m "Get-PolicyInfo returned null for GUID: $guid" -lvl Debug
+                                $ptr += $size
+                                continue
+                            }
+                            
+                            if (-not $catList.ContainsKey($pol.category)) {
+                                LogThis -m "Category not found in catList for GUID: $guid" -lvl Debug
+                                $ptr += $size
+                                continue
+                            }
+                            
+                            $results += @{
+                                Category = $catList[$pol.category]
+                                CategoryGUID = $pol.category
+                                Subcategory = $name.ToString()
+                                SubcategoryGUID = $guid
+                                Success = $pol.success
+                                Failure = $pol.failure
+                            }
+                        } catch {
+                            LogThis -m "Error processing audit policy item ${id}: $($_.Exception.Message)" -lvl Debug
                         }
                         $ptr += $size
                     }
 
                     if ($results) {
-                        $results | ForEach-Object {
-                            [PSCustomObject][ordered]@{
-                                'Default' = "(Category) $($_.Category), (Subcategory) $($_.Subcategory)"
-                                'Settings (+)' = "(Success) $($_.Success), (Failure) $($_.Failure)"
-                            } | & $script:Export -Name "$section-POLICY"
+                        $controlMap = @{
+                            "Account Logon|Credential Validation" = 100
+                            "Account Logon|Kerberos Authentication Service" = 101
+                            "Account Logon|Kerberos Service Ticket Operations" = 102
+                            "Account Logon|Other Account Logon Events" = 103
+                            "Account Management|Computer Account Management" = 104
+                            "Account Management|Other Account Management Events" = 105
+                            "Account Management|Security Group Management" = 106
+                            "Account Management|User Account Management" = 107
+                            "Detailed Tracking|DPAPI Activity" = 108
+                            "Detailed Tracking|Process Creation" = 109
+                            "DS Access|Directory Service Access" = 110
+                            "DS Access|Directory Service Changes" = 111
+                            "Logon/Logoff|Account Lockout" = 112
+                            "Logon/Logoff|Logoff" = 113
+                            "Logon/Logoff|Logon" = 114
+                            "Logon/Logoff|Other Logon/Logoff Events" = 115
+                            "Logon/Logoff|Special Logon" = 116
+                            "Policy Change|Audit Policy Change" = 117
+                            "Policy Change|Authentication Policy Change" = 118
+                            "Policy Change|MPSSVC Rule-Level Policy Change" = 119
+                            "System|IPsec Driver" = 120
+                            "System|Security State Change" = 121
+                            "System|Security System Extension" = 122
+                            "System|System Integrity" = 123
                         }
-            
+
+                        $filteredResults = $results | Where-Object {
+                            $key = "$($_.Category)|$($_.Subcategory)"
+                            $controlMap.ContainsKey($key)
+                        }
+
+                        if ($filteredResults) {
+                            $orderedKeys = $controlMap.Keys
+                            $orderedResults = foreach ($key in $orderedKeys) {
+                                $filteredResults | Where-Object { "$($_.Category)|$($_.Subcategory)" -eq $key }
+                            }
+                        } else {
+                            $orderedResults = @()
+                        }
+
+                        $policyOutput = $orderedResults | ForEach-Object {
+                            $controlKey = "$($_.Category)|$($_.Subcategory)"
+                            $controlValue = $controlMap[$controlKey]
+                            $success = $_.Success
+                            $failure = $_.Failure
+                            $comment = if ($success -and $failure) {
+                                "Both"
+                            } elseif ($success) {
+                                "Success"
+                            } elseif ($failure) {
+                                "Failure"
+                            } else {
+                                "None"
+                            }
+                            [PSCustomObject][ordered]@{
+                                'Category' = $_.Category
+                                'Subcategory' = $_.Subcategory
+                                'Control' = $controlValue
+                                'Success' = $success
+                                'Failure' = $failure
+                                'Comments' = $comment
+                            }
+                        }
+                        $policyOutput | & $script:Export -Name "$section"
+
                         [ordered]@{
                             'Status' = "Evidence Collected"
                         } | & $script:Export -Name $section -IsSummary
                     } else {
                         [ordered]@{
-                            'Status' = "Evidence Failed"
+                            'Status' = "Evidence Collection Failed"
                         } | & $script:Export -Name $section -IsSummary
                     }
-            
+
                     $null = $auditpol::AuditFree($buffer)
-            
                 } catch {
                     LogThis -m "Failed checking audit policies: $_" -lvl Error
                     [ordered]@{
-                        'Status' = $ope
+                        'Status' = $errorValue
                     } | & $script:Export -Name $section -IsSummary
                 }
             }
 
             'COMPUTERS' = {
-                $rawComputers = Get-ADComputer -Filter * -Properties * -Server $script:ADDomain.PDCEmulator
-                $rawComputers | & $script:ExportRaw
                 try {
                     $computers = Get-ADComputer -Filter * -Properties @(
                         'Name', 'DistinguishedName', 'OperatingSystem', 
                         'OperatingSystemVersion', 'LastLogonDate', 'Enabled',
-                        'TrustedForDelegation', 'whenCreated'
+                        'TrustedForDelegation', 'SamAccountName', 'CanonicalName', 'Created'
                     ) -Server $script:ADDomain.PDCEmulator
-                    
-                    $computers | & $script:ExportRaw
 
                     if ($computers) {
-                        $computers | & $script:Export -Name $section
+                        $computers | ForEach-Object {
+                            [PSCustomObject][ordered]@{
+                                'Name' = $_.Name
+                                'SamAccountName' = $_.SamAccountName
+                                'Enabled' = $_.Enabled
+                                'LastLogonDate' = $_.LastLogonDate
+                                'OperatingSystem' = $_.OperatingSystem
+                                'OperatingSystemVersion' = $_.OperatingSystemVersion
+                                'TrustedForDelegation' = $_.TrustedForDelegation
+                                'CreatedDate' = $_.Created
+                                'CanonicalName' = $_.CanonicalName
+                                'DistinguishedName' = $_.DistinguishedName
+                            }
+                        } | & $script:Export -Name $section
 
-                        $osCounts = $computers | Group-Object { "$($_.OperatingSystem) ($($_.OperatingSystemVersion))" } | 
-                            Select-Object @{N='OS';E={$_.Name}}, Count
+                        $serverCount = ($computers | Where-Object { $_.OperatingSystem -like "*Server*" } | Measure-Object).Count
+                        $workstationCount = ($computers | Where-Object { $_.OperatingSystem -like "*Windows*" -and $_.OperatingSystem -notlike "*Server*" } | Measure-Object).Count
+                        $unknownCount = ($computers | Where-Object { $_.OperatingSystem -notlike "*Windows*" -or -not $_.OperatingSystem } | Measure-Object).Count
 
                         [ordered]@{
-                            'Summary (+)' = ($osCounts | ForEach-Object { "($($_.OS)) $($_.Count)" }) -join ', '
+                            'Summary (+)' = "(Servers) $serverCount, (Workstations) $workstationCount, (Unknown) $unknownCount"
                         } | & $script:Export -Name $section -IsSummary
                     } else {
+                        @() | & $script:Export -Name $section -NoResults
                         [ordered]@{
                             'Summary (+)' = "(None) 0"
                         } | & $script:Export -Name $section -IsSummary
                     }
                 } catch {
                     LogThis -m "Failed gathering computers: $_" -lvl Error
+                    @() | & $script:Export -Name $section -IsError
                     [ordered]@{
-                        'Summary (+)' = $ope
+                        'Summary (+)' = $errorValue
                     } | & $script:Export -Name $section -IsSummary
                 }
             }
 
             'SPOOLER' = {
-                $script:DCs | ForEach-Object { Get-WmiObject -Class Win32_Service -Filter "Name='Spooler'" -ComputerName $_.Name} | & $script:ExportRaw
                 try {
-                    $spoolerInfo = $script:DCs | ForEach-Object {
+                    $spoolerInfo = @()
+                    $script:DCs | ForEach-Object {
                         try {
                             $spoolerService = Get-Service -ComputerName $_.Name -Name Spooler
                             $startupConfig = (Get-WmiObject -Class Win32_Service -Filter "Name='Spooler'" -ComputerName $_.Name).StartMode
                             
-                            [PSCustomObject][ordered]@{
-                                'Default' = "(DC) $($_.Name), (Site) $($_.Site)"
-                                'Status (+)' = "(Running) $($spoolerService.Status), (Startup) $startupConfig"
-                            } | & $script:Export -Name $section
+                            $spoolerObj = [PSCustomObject][ordered]@{
+                                'DC' = $_.Name
+                                'Site' = $_.Site
+                                'Status' = $spoolerService.Status
+                                'Startup' = $startupConfig
+                            }
+                            $spoolerInfo += $spoolerObj
+                            $spoolerObj | & $script:Export -Name $section
                         } catch {
                             LogThis -m "Spooler check failed: $($_.Name): $_" -lvl Warn
-                            [PSCustomObject][ordered]@{
-                                'Default' = "(DC) $($_.Name), (Site) $($_.Site)"
-                                'Status (+)' = "(Running) $not, (Startup) $not"
-                            } | & $script:Export -Name $section
+                            $spoolerObj = [PSCustomObject][ordered]@{
+                                'DC' = $_.Name
+                                'Site' = $_.Site
+                                'Status' = $notFound
+                                'Startup' = $notFound
+                            }
+                            $spoolerInfo += $spoolerObj
+                            $spoolerObj | & $script:Export -Name $section
                         }
                     }
-                    
-                    $spoolerInfo | & $script:ExportRaw
 
                     [ordered]@{
-                        'Summary (+)' = "(Total) $($script:DCs.Count), (Running) $(($spoolerInfo | Where-Object { $_.Status -eq 'Running' } | Measure-Object).Count), (Stopped) $(($spoolerInfo | Where-Object { $_.Status -eq 'Stopped' } | Measure-Object).Count), (Disabled) $(($spoolerInfo | Where-Object { $_.Startup -eq 'Disabled' } | Measure-Object).Count)"
+                        'Summary (+)' = "(Total DCs) $($spoolerInfo.Count), (Running) $(($spoolerInfo | Where-Object { $_.Status -eq 'Running' } | Measure-Object).Count), (Stopped) $(($spoolerInfo | Where-Object { $_.Status -eq 'Stopped' } | Measure-Object).Count), (Disabled) $(($spoolerInfo | Where-Object { $_.Startup -eq 'Disabled' } | Measure-Object).Count)"
                     } | & $script:Export -Name $section -IsSummary
 
                 } catch {
                     LogThis -m "Failed checking spooler: $_" -lvl Error
+                    @() | & $script:Export -Name $section -IsError
                     [ordered]@{
-                        'Summary (+)' = "(Total) $ope, (Running) $ope, (Stopped) $ope, (Disabled) $ope"
+                        'Summary (+)' = "(Total DCs) $errorValue, (Running) $errorValue, (Stopped) $errorValue, (Disabled) $errorValue"
                     } | & $script:Export -Name $section -IsSummary
                 }
             }
 
             'NETWORK' = {
-                $script:DCs | ForEach-Object { Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\LanManServer\Parameters" -Name *;Get-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Lsa" -Name *;Get-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\LSA\MSV1_0" -Name *} | & $script:ExportRaw
-
                 try {
                     $registryKeys = @(
                         @{
@@ -1277,10 +2018,10 @@ function Get-Controls {
                                         param($path, $key)
                                         try {
                                             $val = Get-ItemProperty -Path $path -Name $key
-                                            if ($null -eq $val.$key) { return "<null>" }
+                                            if ($null -eq $val.$key) { return $nullValue }
                                             return $val.$key
                                         } catch {
-                                            return "Not Found"
+                                            return $notFound
                                         }
                                     } -ArgumentList $reg.Path, $key
 
@@ -1291,7 +2032,7 @@ function Get-Controls {
                                     }
 
                                 } catch {
-                                    LogThis -m "Failed checking registry on $($dc.Name) for $key : $_" -Level WARN
+                                    LogThis -m "Failed checking registry on $($dc.Name) for $key : $_" -lvl Warn
                                     $results += [PSCustomObject]@{
                                         Server = $dc.Name
                                         Key = $key
@@ -1309,7 +2050,7 @@ function Get-Controls {
                                     if (Test-Path $tempPath) {
                                         $content = Get-Content $tempPath
                                         $lookup = $content | Select-String "LSAAnonymousNameLookup"
-                                        $value = if ($lookup) { $lookup.ToString().Split('=')[1].Trim() } else { "Not Found" }
+                                        $value = if ($lookup) { $lookup.ToString().Split('=')[1].Trim() } else { $notFound }
                                         Remove-Item -Path $tempPath -Force
                                         return $value
                                     }
@@ -1318,9 +2059,7 @@ function Get-Controls {
                                     if (Test-Path $tempPath) { Remove-Item -Path $tempPath -Force }
                                     return "Error: $_"
                                 }
-                            }
-
-                            $results | & $script:ExportRaw
+                            } -ErrorAction SilentlyContinue
 
                             $results += [PSCustomObject]@{
                                 Server = $dc.Name
@@ -1338,29 +2077,59 @@ function Get-Controls {
                         }
                     }
 
-                    $results | Select-Object Server, Key, Value | Export-Csv -Path "$($script:Paths.Export)\$section.csv" -NoTypeInformation
-
-                    $summary = foreach ($key in ($results | Select-Object -ExpandProperty Key -Unique | Sort-Object)) {
-                        $keyResults = $results | Where-Object Key -eq $key
-                        $enabled = ($keyResults | Where-Object { $_.Value -eq 1 }).Count
-                        $disabled = ($keyResults | Where-Object { $_.Value -eq 0 }).Count
-                        $errors = ($keyResults | Where-Object { $_.Value -like 'Error:*' -or $_.Value -eq 'Not Found' }).Count
-                        
-                        [PSCustomObject][ordered]@{
-                            Key = $key
-                            Summary = "Enabled: $enabled, Disabled: $disabled" + $(if($errors -gt 0) { ", Errors: $errors" })
-                        }
+                    if ($results) {
+                        $results | Select-Object Server, Key, Value | & $script:Export -Name $section
+                    } else {
+                        @() | & $script:Export -Name $section -NoResults
                     }
 
-                    $summary | Export-Csv -Path "$($script:Paths.Export)\$section-summary.csv" -NoTypeInformation
+                    $complianceSummary = @{}
+                    $totalDCs = $script:DCs.Count
+                    
+                    # Compliance
+                    $expectedValues = @{
+                        'RestrictNullSessAccess' = 1
+                        'NullSessionShares' = 0
+                        'RestrictAnonymousSAM' = 1
+                        'RestrictAnonymous' = 1
+                        'EveryoneIncludesAnonymous' = 0
+                        'allownullsessionfallback' = 0
+                        'LSAAnonymousNameLookup' = 0
+                    }
+                    
+                    # Count compliant DCs for each
+                    foreach ($setting in $expectedValues.Keys) {
+                        $compliantDCs = ($results | Where-Object { 
+                            $_.Key -eq $setting -and 
+                            $_.Value -eq $expectedValues[$setting] 
+                        } | Measure-Object).Count
+                        
+                        $complianceSummary[$setting] = "$($expectedValues[$setting]) ($compliantDCs of $totalDCs)"
+                    }
+                    
+                    [ordered]@{
+                        'RestrictNullSessAccess' = $complianceSummary['RestrictNullSessAccess']
+                        'NullSessionShares' = $complianceSummary['NullSessionShares']
+                        'RestrictAnonymousSAM' = $complianceSummary['RestrictAnonymousSAM']
+                        'RestrictAnonymous' = $complianceSummary['RestrictAnonymous']
+                        'EveryoneIncludesAnonymous' = $complianceSummary['EveryoneIncludesAnonymous']
+                        'allownullsessionfallback' = $complianceSummary['allownullsessionfallback']
+                        'LSAAnonymousNameLookup' = $complianceSummary['LSAAnonymousNameLookup']
+                    } | & $script:Export -Name $section -IsSummary
 
                 } catch {
                     LogThis -m "Failed checking network registry settings: $_" -lvl Error
-                    "Operation Failed" | Out-File -FilePath "$($script:Paths.Export)\$section-summary.csv"
+                    [ordered]@{
+                        'Status' = "Evidence Collection Failed"
+                    } | & $script:Export -Name $section -IsSummary
                 }
             }
 
-            <#'CERTIFICATES' = {
+            'ADCS' = {
+                if ($env:COMPUTERNAME -eq 'TRUST') {
+                    LogThis -m "Skipping CERTIFICATES section on TRUST host" -lvl Info
+                    return
+                }
                 try {
                     $caCheck = certutil -CA
                     if ($LASTEXITCODE -eq 0) {
@@ -1384,7 +2153,7 @@ function Get-Controls {
                                         "EndpointUri=$($_.Uri); IsHttps=$isHttps; Auth=$($_.Authentication); UsesNTLM=$usesNTLM"
                                     }
                                 }
-                                $enrollmentEndpoints = if ($endpointDetails) { $endpointDetails -join " | " } else { $not }
+                                $enrollmentEndpoints = if ($endpointDetails) { $endpointDetails -join " | " } else { $notFound }
                                 
                                 @{
                                     Name               = $ca.Name
@@ -1453,26 +2222,22 @@ function Get-Controls {
 
                                 # Check if template has sensitive capabilities
                                 $SensitiveKeyUsage = @(
-                                    # Has authentication EKUs
-                                    [bool]($TemplateProps.'pKIExtendedKeyUsage' | Where-Object { 
+                                    [bool]($TemplateProps.'pKIExtendedKeyUsage' | Where-Object { # Has authentication EKUs
                                         $_ -in @(
                                             "1.3.6.1.5.5.7.3.2",    # Client Authentication
                                             "1.3.6.1.5.2.3.4",      # PKINIT Client Authentication
                                             "1.3.6.1.4.1.311.20.2.2" # Smart Card Logon
                                         )
                                     }),
-                                    # Has dangerous EKUs
-                                    [bool]($TemplateProps.'pKIExtendedKeyUsage' -contains "2.5.29.37.0" -or 
+                                    
+                                    [bool]($TemplateProps.'pKIExtendedKeyUsage' -contains "2.5.29.37.0" -or # Has dangerous EKUs
                                         $null -eq $TemplateProps.'pKIExtendedKeyUsage'),
-                                    # Allows SAN specification
-                                    [bool]($TemplateProps.'msPKI-Certificate-Name-Flag' -band 0x00000001)
+                                    [bool]($TemplateProps.'msPKI-Certificate-Name-Flag' -band 0x00000001) # Allows SAN specification
                                 ) -contains $true
+                                
+                                $CAManagerApproval = [bool]($TemplateProps.'msPKI-Enrollment-Flag' -band 0x02) # Check for CA Manager Approval requirement
 
-                                # Check for CA Manager Approval requirement
-                                $CAManagerApproval = [bool]($TemplateProps.'msPKI-Enrollment-Flag' -band 0x02)
-
-                                # Determine risk level
-                                $riskLevel = if ($SensitiveKeyUsage -and $LowPrivilegedEnrollment -and !$CAManagerApproval) {
+                                $riskLevel = if ($SensitiveKeyUsage -and $LowPrivilegedEnrollment -and !$CAManagerApproval) { # Determine risk level
                                     "CRITICAL - Authentication keys with broad enrollment, no manager approval"
                                 } elseif ($SensitiveKeyUsage -and $LowPrivilegedEnrollment) {
                                     "HIGH - Authentication keys with broad enrollment, requires approval"
@@ -1498,7 +2263,7 @@ function Get-Controls {
                             })
                             $filteredResults | & $script:Export -Name "$section-TEMPLATES"
                             LogThis -m "Exported '$section-TEMPLATES'"
-                            # Generate and export summary
+                            
                             [ordered]@{
                                 'Total' = ($filteredResults | Measure-Object).Count
                                 'Sensitive' = ($filteredResults | Where-Object { $_.SensitiveKeyUsage }).Count
@@ -1522,26 +2287,48 @@ function Get-Controls {
 
                     # NTAuth  
                         LogThis -m "Processing NTAuth Certificates" -show "NTAuth Certificates"
-                        $domain = (Get-ADDomain).DNSRoot
-                        if ($domain) {
-                            $ntAuthPath = "CN=NtAuthCertificates,CN=Public Key Services,CN=Services,CN=Configuration,DC=$($domain -replace '\.',',DC=')"
-                            $ntAuthCertificates = @(Get-ADObject -Filter * -SearchBase $ntAuthPath -Properties * | 
-                                Select-Object CanonicalName, CN, Created, Description, DisplayName, objectClass)
-                            $ntAuthCertificates | & $script:Export -Name "$section-NTAUTH"
-                            LogThis -m "Exported '$section-NTAUTH'"
+                        try {
+                            $domain = (Get-ADDomain).DNSRoot
+                            if ($domain) {
+                                $ntAuthPath = "CN=NtAuthCertificates,CN=Public Key Services,CN=Services,CN=Configuration,DC=$($domain -replace '\.',',DC=')"
+                                LogThis -m "NTAuth path: $ntAuthPath" -lvl Debug
+                                
+                                $ntAuthCertificates = @(Get-ADObject -Filter * -SearchBase $ntAuthPath -Properties * -ErrorAction SilentlyContinue | 
+                                    Select-Object CanonicalName, CN, Created, Description, DisplayName, objectClass)
+                                
+                                if ($ntAuthCertificates) {
+                                    $ntAuthCertificates | & $script:Export -Name "$section-NTAUTH"
+                                    LogThis -m "Exported '$section-NTAUTH'"
+                                    [ordered]@{
+                                        'Total' = ($ntAuthCertificates).Count
+                                    } | & $script:Export -Name "$section-NTAUTH" -IsSummary
+                                    LogThis -m "Exported '$section-NTAUTH'-IsSummary"
+                                } else {
+                                    LogThis -m "No NTAuth certificates found in path" -lvl Warn
+                                    [ordered]@{
+                                        'Status' = "No NTAuth Certificates found in path"
+                                    } | & $script:Export -Name "$section-NTAUTH-NONE-FOUND"
+                                    [ordered]@{ 
+                                        'Status' = "No NTAuth Certificates found in path" 
+                                    } | & $script:Export -Name "$section-NTAUTH" -IsSummary
+                                }
+                            } else {
+                                LogThis -m "Could not determine domain DNS root" -lvl Warn
+                                [ordered]@{
+                                    'Status' = "Could not determine domain DNS root"
+                                } | & $script:Export -Name "$section-NTAUTH-ERROR"
+                                [ordered]@{ 
+                                    'Status' = "Could not determine domain DNS root" 
+                                } | & $script:Export -Name "$section-NTAUTH" -IsSummary
+                            }
+                        } catch {
+                            LogThis -m "Error processing NTAuth certificates: $_" -lvl Error -ex $_
                             [ordered]@{
-                                'Total' = ($ntAuthCertificates).Count
-                            } | & $script:Export -Name "$section-NTAUTH" -IsSummary
-                            LogThis -m "Exported '$section-NTAUTH'-IsSummary"
-                        } else {
-                            [ordered]@{
-                                'Status' = "No NTAuth Certificates found"
-                            } | & $script:Export -Name "$section-NTAUTH-NONE-FOUND"
-                            LogThis -m "Exported '$section-NTAUTH-NONE-FOUND'"
+                                'Status' = "Error processing NTAuth certificates: $($_.Exception.Message)"
+                            } | & $script:Export -Name "$section-NTAUTH-ERROR"
                             [ordered]@{ 
-                                'Status' = "No NTAuth Certificates found" 
+                                'Status' = "Error processing NTAuth certificates: $($_.Exception.Message)" 
                             } | & $script:Export -Name "$section-NTAUTH" -IsSummary
-                            LogThis -m "Exported '$section-NTAUTH'-IsSummary"
                         }
 
                     # Logging
@@ -1549,8 +2336,7 @@ function Get-Controls {
                         $logging = @(foreach ($ca in $cas) {
                             LogThis -m "Auditing logging for: $($ca.ComputerName)" -lvl Debug
 
-                            # Category Logging (Success & Failure)
-                            $auditPolicy = try { 
+                            $auditPolicy = try { # Category Logging (Success & Failure)
                                 $output = auditpol /get /subcategory:"Certification Services" | Out-String
                                 if ($output -match 'Certification Services\s+(.+)$') {
                                     $matches[1].Trim()
@@ -1562,9 +2348,8 @@ function Get-Controls {
                             } catch { 
                                 "Error: $($_.Exception.Message)"
                             }
-
-                            # Subcategory Logging (127)
-                            $auditConfig = try {
+                            
+                            $auditConfig = try { # Subcategory Logging (127)
                                 $output = certutil -getreg CA\AuditFilter | Out-String
                                 if ($output -match 'AuditFilter REG_DWORD = ([\da-fA-F]+)') {
                                     $value = $matches[1]
@@ -1582,8 +2367,7 @@ function Get-Controls {
                                 "Error: $($_.Exception.Message)"
                             }
 
-                            # Subcategory supercedes category (1)
-                            $scePolicy = try { 
+                            $scePolicy = try { # Subcategory supercedes category (1)
                                 $value = Get-ItemPropertyValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'SCENoApplyLegacyAuditPolicy'
                                 if ($null -eq $value) { "Not configured" } else { $value }
                             } catch {
@@ -1594,7 +2378,6 @@ function Get-Controls {
                                 }
                             }
 
-                            # Result Object
                             @{
                                 Name = $ca.ComputerName
                                 SCEPolicy = $scePolicy
@@ -1605,8 +2388,12 @@ function Get-Controls {
                                 HasAuditConfig = $auditConfig -match "Success|Failure"
                             }
                         }) 
-                        $logging | & $script:Export -Name "$section-LOGGING"
-                        LogThis -m "Exported '$section-LOGGING'"
+                        if ($logging) {
+                            $logging | & $script:Export -Name "$section-LOGGING"
+                            LogThis -m "Exported '$section-LOGGING'"
+                        } else {
+                            @() | & $script:Export -Name "$section-LOGGING" -NoResults
+                        }
                         [ordered]@{
                             'CAs' = ($cas | Measure-Object).Count
                             'Compliant' = ($logging | Where-Object { 
@@ -1617,8 +2404,7 @@ function Get-Controls {
                             'Compliant Config' = ($logging | Where-Object HasAuditConfig | Measure-Object).Count
                         } | & $script:Export -Name "$section-LOGGING" -IsSummary
 
-                        # Generate detailed audit log
-                        $auditLog = foreach ($ca in $logging) {
+                        $auditLog = foreach ($ca in $logging) { # Generate detailed audit log
                             "CA: $($ca.Name)"
                             "SCE Policy: $($ca.SCEPolicy)"
                             "Audit Policy: $($ca.AuditPolicy)"
@@ -1626,27 +2412,555 @@ function Get-Controls {
                             "----------------------------------------"
                         }
 
-                        # Export audit log
-                        $auditLog | Out-File -FilePath (Join-Path $script:Directory "$($script:Filename)-$section-audit.txt") -Encoding UTF8
+                        if ($auditLog) { # Export audit log
+                            $auditLog | Out-File -FilePath (Join-Path $script:Directory "$section-audit-$($script:Filename).txt") -Encoding UTF8
+                        }
 
                     } else {
                         LogThis -m "ADCS not found (Exit Code: $LASTEXITCODE)" -lvl Info
+                        @() | & $script:Export -Name "$section-LOGGING" -NoResults
                         [ordered]@{
                             'Status' = "ADCS not installed"
                         } | & $script:Export -Name "$section-NONE-FOUND" -IsSummary
                     }
                 } catch {
                     LogThis -m "Certificate processing failed" -lvl Error -ex $_
+                    @() | & $script:Export -Name "$section-LOGGING" -IsError
                     [ordered]@{
                         'Status' = "Error: $($_.Exception.Message)"
                     } | & $script:Export -Name "$section-ERROR" -IsSummary
                 }
-            }#>
+            }
+
+            'RAS' = {
+                try {
+                    LogThis -m "RAS: Using server $($script:ADDomain.PDCEmulator) for domain $($script:ADDomain.DNSRoot)" -lvl Debug
+                    $group = Get-ADGroup -Filter { Name -eq 'RAS and IAS Servers' } -Properties CanonicalName -Server $script:ADDomain.PDCEmulator
+                    if ($group) {
+                        LogThis -m "RAS: Found group '$($group.Name)' at $($group.DistinguishedName)" -lvl Debug
+                        $members = Get-ADGroupMember -Identity $group.DistinguishedName -Server $script:ADDomain.PDCEmulator
+                        LogThis -m "RAS: Total members found: $($members.Count)" -lvl Debug
+                        LogThis -m "RAS: All members: $members" -lvl Debug
+                        
+                        $realMembers = $members | Where-Object { 
+                            $_.ObjectClass -eq 'user' -or $_.ObjectClass -eq 'computer' 
+                        }
+                        
+                        if ($realMembers.Count -eq 0) {
+                            LogThis -m "RAS group found but contains no registered RAS servers (only system objects)" -lvl Info
+                            @() | & $script:Export -Name "$section-SERVERS" -NoResults
+                            @() | & $script:Export -Name "$section-CONFIG" -NoResults
+                            [ordered]@{
+                                'Summary (+)' = "(Total) 0, (Servers) No registered RAS servers"
+                            } | & $script:Export -Name $section -IsSummary
+                            return
+                        }
+                        
+                        $membersWithProps = $realMembers | ForEach-Object {
+                            if ($_.ObjectClass -eq 'user') {
+                                Get-ADUser -Identity $_.DistinguishedName -Properties CanonicalName -Server $script:ADDomain.PDCEmulator
+                            } elseif ($_.ObjectClass -eq 'computer') {
+                                Get-ADComputer -Identity $_.DistinguishedName -Properties CanonicalName -Server $script:ADDomain.PDCEmulator
+                            }
+                        }
+                        
+                        if ($realMembers) {
+                            $rasData = $membersWithProps | ForEach-Object {
+                                [PSCustomObject]@{
+                                    Name = $_.Name
+                                    SamAccountName = $_.SamAccountName
+                                    ObjectClass = $_.ObjectClass
+                                    CanonicalName = $_.CanonicalName
+                                    DistinguishedName = $_.DistinguishedName
+                                }
+                            }
+                            $rasData | & $script:Export -Name "$section-SERVERS"                   
+                            $npsConfig = $null
+                            $workingServer = $null
+                            
+                            foreach ($member in $membersWithProps) {
+                                try {
+																									  
+                                    $npsConfig = Invoke-Command -ComputerName $member.Name -ScriptBlock {
+                                        try {
+                                            $output = netsh nps show config
+                                            
+                                            function Resolve-SIDs {
+                                                param([string]$text)
+                                                $pattern = 'S-1-5-21-[0-9-]+'
+                                                $regexMatches = [regex]::Matches($text, $pattern)
+                                                
+                                                foreach ($match in $regexMatches) {
+                                                    $sid = $match.Value
+                                                    try {
+                                                        $obj = [System.Security.Principal.SecurityIdentifier]$sid
+                                                        $ntAccount = $obj.Translate([System.Security.Principal.NTAccount])
+                                                        $text = $text -replace [regex]::Escape($sid), $ntAccount.Value
+                                                    } catch {
+                                                    }
+                                                }
+                                                return $text
+                                            }
+                                            
+                                            $resolvedOutput = @()
+                                            foreach ($line in $output) {
+                                                if ($line -notmatch "Shared secret") {
+                                                    $resolvedOutput += Resolve-SIDs -text $line
+                                                }
+                                            }
+                                            
+                                            return $resolvedOutput
+                                        } catch {
+                                            return "Error: $($_.Exception.Message)"
+                                        }
+                                    } -ErrorAction SilentlyContinue
+                                    
+                                    if ($npsConfig -and $npsConfig -notlike "Error:*") {
+                                        $workingServer = $member.Name
+                                        break
+                                    } else {
+                                        LogThis -m "Failed to get NPS config from $($member.Name): $npsConfig" -lvl Warn
+                                    }
+                                } catch {
+                                    LogThis -m "Failed to connect to $($member.Name): $_" -lvl Warn
+                                }
+                            }
+                            
+                            if ($npsConfig -and $workingServer) {
+                                [PSCustomObject]@{
+                                    Server = $workingServer
+                                    Config = $npsConfig -join "`n"
+                                } | & $script:Export -Name "$section-CONFIG"
+                            } else {
+                                @() | & $script:Export -Name "$section-CONFIG" -NoResults
+                            }
+					
+                        } else {
+                            @() | & $script:Export -Name "$section-MEMBERS" -NoResults
+																				  
+                            @() | & $script:Export -Name "$section-CONFIG" -NoResults
+                        }
+                        
+                        [ordered]@{
+                            'Summary (+)' = "(Total) $($membersWithProps.Count), (Servers) $($membersWithProps.Name -join ', ')"
+                        } | & $script:Export -Name $section -IsSummary
+                    } else {
+                        [ordered]@{
+                            'Summary (+)' = "(Total) 0, (Servers) None found"
+                        } | & $script:Export -Name $section -IsSummary
+                    }
+                } catch {
+                    LogThis -m "RAS section failed: $_" -lvl Error
+                    @() | & $script:Export -Name "$section-MEMBERS" -IsError
+                    @() | & $script:Export -Name "$section-CONFIG" -IsError
+                    [ordered]@{ 'Status' = "Failure: $_" } | & $script:Export -Name $section -IsSummary
+                }
+            }
+
+            'TASKS' = {
+                try {
+                    LogThis -m "Starting Scheduled Tasks assessment for ntdsutil.exe" -lvl Info
+                    
+                    $ntdsutilTasks = Get-ScheduledTask | Where-Object { $_.Actions.Execute -like "*ntdsutil.exe*" }
+                    
+                    if ($ntdsutilTasks) {
+                        $allTaskData = @()
+                        
+                        foreach ($task in $ntdsutilTasks) {
+                            $taskInfo = Get-ScheduledTaskInfo -TaskName $task.TaskName -TaskPath $task.TaskPath; 
+                            $triggers = $task.Triggers | ForEach-Object { 
+                                $trigger = $_; 
+                                $triggerType = $trigger.CimClass.CimClassName; 
+                                switch ($triggerType) { 
+                                    "MSFT_TaskDailyTrigger" { 
+                                        $startTime = [datetime]::Parse($trigger.StartBoundary); 
+                                        "At $($startTime.ToString('HH:mm')) every day" 
+                                    } 
+                                    "MSFT_TaskWeeklyTrigger" { 
+                                        $startTime = [datetime]::Parse($trigger.StartBoundary); 
+                                        "At $($startTime.ToString('HH:mm')) every $($trigger.DaysOfWeek)" 
+                                    } 
+                                    "MSFT_TaskBootTrigger" { "At system startup" } 
+                                    "MSFT_TaskLogonTrigger" { "At log on of $($trigger.UserId)" } 
+                                    "MSFT_TaskEventTrigger" { "When a specific event is logged" } 
+                                    "MSFT_TaskTimeTrigger" { 
+                                        $startTime = [datetime]::Parse($trigger.StartBoundary); 
+                                        "At $($startTime.ToString('M/d/yyyy HH:mm'))" 
+                                    } 
+                                    "MSFT_TaskIdleTrigger" { "When the computer is idle" } 
+                                    "MSFT_TaskRegistrationTrigger" { "When the task is created or modified" } 
+                                    "MSFT_TaskSessionStateChangeTrigger" { "At workstation lock/unlock" } 
+                                    "MSFT_TaskCustomTrigger" { "Custom trigger" } 
+                                    default { "$triggerType - $($trigger.StartBoundary)" } 
+                                } 
+                            }
+                            
+                            $allTaskData += [PSCustomObject]@{ 
+                                Name = $task.TaskName; 
+                                Status = $task.State; 
+                                Triggers = $triggers -join '; '; 
+                                NextRunTime = $taskInfo.NextRunTime; 
+                                LastRunTime = $taskInfo.LastRunTime; 
+                                Actions = "$($task.Actions.Execute) $($task.Actions.Arguments)" 
+                            }
+                            
+                            $taskArgs = $task.Actions.Arguments
+                            if ($taskArgs -match 'dsrm' -and $taskArgs -match 'account (\w+)') {
+                                $userAccount = $matches[1]
+                                try {
+                                    $passwordPolicy = Get-ADUserResultantPasswordPolicy -Identity $userAccount
+                                    
+                                    $allTaskData += [PSCustomObject]@{ 
+                                        Name = ""; 
+                                        Status = ""; 
+                                        Triggers = ""; 
+                                        NextRunTime = ""; 
+                                        LastRunTime = ""; 
+                                        Actions = "" 
+                                    }
+                                    
+                                    $allTaskData += [PSCustomObject]@{ 
+                                        Name = "Password Policy for $userAccount"; 
+                                        Status = "MaxPasswordAge: $($passwordPolicy.MaxPasswordAge) days"; 
+                                        Triggers = "MinPasswordLength: $($passwordPolicy.MinPasswordLength)"; 
+                                        NextRunTime = "PasswordComplexity: $($passwordPolicy.ComplexityEnabled)"; 
+                                        LastRunTime = "PasswordHistoryCount: $($passwordPolicy.PasswordHistoryCount)"; 
+                                        Actions = "LockoutThreshold: $($passwordPolicy.LockoutThreshold)" 
+                                    }
+                                } catch {
+
+                                    $allTaskData += [PSCustomObject]@{ 
+                                        Name = ""; 
+                                        Status = ""; 
+                                        Triggers = ""; 
+                                        NextRunTime = ""; 
+                                        LastRunTime = ""; 
+                                        Actions = "" 
+                                    }
+                                    
+                                    $allTaskData += [PSCustomObject]@{ 
+                                        Name = "Password Policy for $userAccount"; 
+                                        Status = "Error"; 
+                                        Triggers = "Could not retrieve password policy"; 
+                                        NextRunTime = ""; 
+                                        LastRunTime = ""; 
+                                        Actions = "" 
+                                    }
+                                }
+                            }
+                        }
+                        
+                        $allTaskData | & $script:Export -Name $section
+                        LogThis -m "Found $($ntdsutilTasks.Count) scheduled tasks with ntdsutil.exe" -lvl Info
+                        
+                        [ordered]@{
+                            'Summary' = "(ntdsutil Tasks) $($ntdsutilTasks.Count)"
+                        } | & $script:Export -Name $section -IsSummary
+                    } else {
+                        @() | & $script:Export -Name $section -NoResults
+                        LogThis -m "No scheduled tasks found with ntdsutil.exe" -lvl Info
+                        
+                        [ordered]@{
+                            'Summary' = "(ntdsutil Tasks) 0"
+                        } | & $script:Export -Name $section -IsSummary
+                    }
+                    
+                } catch {
+                    LogThis -m "Scheduled Tasks assessment failed: $_" -lvl Error
+                    @() | & $script:Export -Name $section -IsError
+                }
+            }
         }
         
-        $sectionsToProcess = $Controls.Keys
-        foreach ($section in $sectionsToProcess) {
-            $script:SectionCounter++  # Add counter increment here
+        $Controls['DNS'] = {
+                try {
+                    $domain = $script:ADDomain.DNSRoot
+                    $dnsZone = $domain
+                    $dnsRecords = Get-DnsServerResourceRecord -ZoneName $dnsZone -ComputerName $script:ADDomain.PDCEmulator -ErrorAction Stop | Where-Object { $_.RecordType -eq 'A' }
+                    $results = $dnsRecords | ForEach-Object {
+                        [PSCustomObject][ordered]@{
+                            HostName = $_.HostName
+                            IPAddress = $_.RecordData.IPv4Address.IPAddressToString
+                        }
+                    }
+                    $results | & $script:Export -Name $section
+                    [ordered]@{
+                        'Summary (+)' = "(Total A Records) $($results.Count)"
+                    } | & $script:Export -Name $section -IsSummary
+                } catch {
+                    LogThis -m "Failed getting DNS A records: $_" -lvl Error
+                    [ordered]@{
+                        'Summary (+)' = "(Error) Unable to enumerate DNS A records"
+                    } | & $script:Export -Name $section -IsSummary
+                }
+            }
+        
+        if ($Proxy) {
+            $Controls['DUO_PROXY'] = {
+                try {
+                    Write-Host "PROVIDE DUO PROXY FQDN OR IP ADDRESS:" -ForegroundColor Yellow -NoNewline
+                    $s = Read-Host
+                    LogThis -m "User input Duo server: $s" -lvl Info
+                    
+                    if ([string]::IsNullOrWhiteSpace($s)) {
+                        LogThis -m "No Duo proxy server provided" -lvl Error -show "No server provided"
+                        [ordered]@{ 'Status' = "No server provided" } | & $script:Export -Name "DUO_PROXY" -IsSummary
+                        return
+                    }
+                    
+                    LogThis -m "Starting Duo Proxy Configuration assessment" -lvl Info -show "AUTHPROXY.CFG"
+                    
+                    if($s -eq "localhost" -or $s -eq "127.0.0.1") {
+                        $s = [System.Net.Dns]::GetHostName()
+                    }
+
+                    $f = "\\$s\c$\Program Files\Duo Security Authentication Proxy\conf\authproxy.cfg"
+
+                    try {
+                        
+                        if(Test-Path $f) {
+                            LogThis -m "Found Duo proxy configuration: $s" -lvl Info
+                            $c = Get-Content $f
+                            
+                            $sanitizedContent = $c | ForEach-Object {
+                                if($_ -match "^radius_secret_1=(.*)") { "radius_secret_1=**********" }
+                                elseif($_ -match "^radius_secret_2=(.*)") { "radius_secret_2=**********" }
+                                elseif($_ -match "^skey=(.*)") { "skey=**********" }
+                                elseif($_ -match "^.*password.*=(.*)" -and $_ -notmatch "^#") { $_ -replace "=(.*)$", "=**********" }
+                                else { $_ }
+                            }
+                            
+                            $txtFilePath = Join-Path $script:Directory "DUO_PROXY-$($script:Filename).txt"
+                            $sanitizedContent | Out-File -FilePath $txtFilePath -Encoding UTF8
+                            LogThis -m "Saved sanitized authproxy.cfg to: $txtFilePath" -lvl Info
+                            
+                            [ordered]@{
+                                'Status' = "Gathered"
+                            } | & $script:Export -Name "DUO_PROXY" -IsSummary
+                            
+                            LogThis -m "Duo proxy configuration assessment completed successfully" -lvl Info
+                            
+                        } else {
+                            LogThis -m "Duo proxy configuration file not found on $s" -lvl Warn
+                            [ordered]@{ 'Status' = "File not found: $f" } | & $script:Export -Name "DUO_PROXY" -IsSummary
+                        }
+                    } catch {
+                        LogThis -m "Failed to connect to Duo proxy server $s" -lvl Error
+                        [ordered]@{ 'Status' = "Connection failed: $s" } | & $script:Export -Name "DUO_PROXY" -IsSummary
+                    }
+                    
+                } catch {
+                    LogThis -m "Duo proxy configuration assessment failed: $_" -lvl Error
+                    [ordered]@{ 'Status' = "Assessment failed: $_" } | & $script:Export -Name "DUO_PROXY" -IsSummary
+                }
+            }
+        }
+        
+        if ($Duo) {
+            $Controls['DUO'] = {
+                try {
+                    try {
+                        Write-Host "PROVIDE DUO INTEGRATION KEY:" -ForegroundColor Yellow -NoNewline
+                        $IntegrationKey = Read-Host
+                        Write-Host "PROVIDE DUO SECRET KEY:" -ForegroundColor Yellow -NoNewline
+                        $SecretKey = Read-Host -AsSecureString
+                        $SecretKey = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecretKey))
+                        Write-Host "PROVIDE DUO API HOST:" -ForegroundColor Yellow -NoNewline
+                        $ApiHost = Read-Host
+                        
+                        if ([string]::IsNullOrWhiteSpace($IntegrationKey) -or [string]::IsNullOrWhiteSpace($SecretKey) -or [string]::IsNullOrWhiteSpace($ApiHost)) {
+                            LogThis -m "Incomplete Duo credentials provided" -lvl Error -show "Incomplete credentials"
+                            [ordered]@{ 'Status' = "Incomplete credentials" } | & $script:Export -Name "DUO" -IsSummary
+                            return
+                        }
+                        
+                        LogThis -m "Starting Duo Admin API assessment" -lvl Info -show "DUO"
+                        
+                        LogThis -m "Setting up Duo authentication"
+                        
+                        try {
+                            LogThis -m "Duo authentication configured"
+                        } catch {
+                            LogThis -m "Failed to configure Duo authentication: $_" -lvl Error
+                            throw
+                        }
+                        
+                        LogThis -m "Querying Duo integrations" -show "APPLICATIONS"
+                        
+                        try {
+                            $duoApps = Get-DuoIntegration
+                            LogThis -m "Total integrations found: $($duoApps.Count)"
+                            LogThis -m "Integration names: $($duoApps.name -join ', ')"
+                            
+                            foreach ($app in $duoApps) {
+                                LogThis -m "Integration: $($app.name) - Type: $($app.type)" -lvl Debug
+                            }
+                            
+                            $duoTargetApps = $duoApps | Where-Object { $_.name -match "(Fortinet|FortiGate|SSL|VPN)" }
+                            
+                            if ($duoTargetApps) {
+                                LogThis -m "Found target applications"
+                                LogThis -m "Target app names: $($duoTargetApps.name -join ', ')"
+                                
+                                foreach ($app in $duoTargetApps) {
+                                    LogThis -m "Target app: $($app.name) - ID: $($app.integration_key)" -lvl Debug
+                                }
+                            } else {
+                                LogThis -m "No Fortinet/FortiGate/SSL/VPN applications found" -lvl Warn
+                                @() | & $script:Export -Name "DUO" -NoResults
+                                LogThis -m "Duo assessment completed" -lvl Done -show "`nCOMPLETED"
+                                return
+                            }
+                        } catch {
+                            LogThis -m "Failed querying Duo integrations: $_" -lvl Error
+                            throw
+                        }
+                        
+                        LogThis -m "Querying Duo users"
+                        
+                        try {
+                            $duoUsers = Get-DuoUser
+                            LogThis -m "Total users found: $($duoUsers.Count)"
+                            LogThis -m "User names: $($duoUsers.username -join ', ')"
+                            
+                            foreach ($user in $duoUsers) {
+                                LogThis -m "User: $($user.username) - ID: $($user.user_id) - Groups: $($user.groups.Count)" -lvl Debug
+                            }
+                        } catch {
+                            LogThis -m "Failed querying Duo users: $_" -lvl Error
+                            throw
+                        }
+                        
+                        LogThis -m "Querying Duo groups" -show "MEMBERS"
+                        
+                        try {
+                            $duoGroups = Get-DuoGroup
+                            LogThis -m "Total groups found: $($duoGroups.Count)"
+                            LogThis -m "Group names: $($duoGroups.name -join ', ')"
+                            
+                            foreach ($group in $duoGroups) {
+                                LogThis -m "Group: $($group.name) - ID: $($group.group_id)" -lvl Debug
+                            }
+                        } catch {
+                            LogThis -m "Failed querying Duo groups: $_" -lvl Error
+                            throw
+                        }
+                        
+                        LogThis -m "Processing user access settings"
+                        
+                        $duoData = @()
+                        
+                        foreach ($duoTargetApp in $duoTargetApps) {
+                            try {
+                                LogThis -m "Raw groups_allowed value: '$($duoTargetApp.groups_allowed)'" -lvl Debug
+                                LogThis -m "Groups_allowed type: $($duoTargetApp.groups_allowed.GetType().Name)" -lvl Debug
+                                
+                                if ($duoTargetApp.groups_allowed -eq 'deny') {
+                                    $userAccessSetting = "Disabled for all users"
+                                } elseif ($duoTargetApp.groups_allowed -and $duoTargetApp.groups_allowed.Count -gt 0) {
+                                    $userAccessSetting = "Enable only for permitted groups"
+                                } else {
+                                    $userAccessSetting = "Enable for all users"
+                                }
+                                
+                                LogThis -m "Application: $($duoTargetApp.name) - User Access: $userAccessSetting" -lvl Info
+                                LogThis -m "Groups allowed: $($duoTargetApp.groups_allowed)" -lvl Debug
+                                
+                                if ($userAccessSetting -eq "Enable only for permitted groups") {
+                                    LogThis -m "Processing group-based access for $($duoTargetApp.name)"
+                                    
+                                    foreach ($duoUser in $duoUsers) {
+                                        if ($duoUser.groups) {
+                                            foreach ($duoUserGroup in $duoUser.groups) {
+                                                $duoData += [PSCustomObject]@{
+                                                    ObjectType = "User"
+                                                    Username = $duoUser.username
+                                                    RealName = $duoUser.realname
+                                                    Email = $duoUser.email
+                                                    UserId = $duoUser.user_id
+                                                    Application = $duoTargetApp.name
+                                                    UserAccess = $userAccessSetting
+                                                    GroupName = $duoUserGroup.name
+                                                    GroupId = $duoUserGroup.group_id
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    foreach ($duoGroup in $duoGroups) {
+                                        $duoData += [PSCustomObject]@{
+                                            ObjectType = "Group"
+                                            Username = ""
+                                            RealName = ""
+                                            Email = ""
+                                            UserId = ""
+                                            Application = $duoTargetApp.name
+                                            UserAccess = $userAccessSetting
+                                            GroupName = $duoGroup.name
+                                            GroupId = $duoGroup.group_id
+                                        }
+                                    }
+                                } elseif ($userAccessSetting -eq "Enable for all users") {
+                                    LogThis -m "Processing all-users access for $($duoTargetApp.name)"
+                                    
+                                    foreach ($duoUser in $duoUsers) {
+                                        $duoData += [PSCustomObject]@{
+                                            ObjectType = "User"
+                                            Username = $duoUser.username
+                                            RealName = $duoUser.realname
+                                            Email = $duoUser.email
+                                            UserId = $duoUser.user_id
+                                            Application = $duoTargetApp.name
+                                            UserAccess = $userAccessSetting
+                                            GroupName = "All Users"
+                                            GroupId = ""
+                                        }
+                                    }
+                                } else {
+                                    LogThis -m "Application is disabled for all users: $($duoTargetApp.name)"
+                                    $duoData += [PSCustomObject]@{
+                                        ObjectType = "Application"
+                                        Username = ""
+                                        RealName = ""
+                                        Email = ""
+                                        UserId = ""
+                                        Application = $duoTargetApp.name
+                                        UserAccess = $userAccessSetting
+                                        GroupName = "No Access"
+                                        GroupId = ""
+                                    }
+                                }
+                            } catch {
+                                LogThis -m "Failed processing application $($duoTargetApp.name): $_" -lvl Error
+                            }
+                        }
+                        
+                        LogThis -m "Exporting $($duoData.Count) records"
+                        
+                        foreach ($item in $duoData) {
+                            LogThis -m "Data item: $($item.ObjectType) - $($item.Username) - $($item.GroupName)" -lvl Debug
+                        }
+                        
+                        if ($duoData.Count -gt 0) {
+                            $duoData | & $script:Export -Name "DUO"
+                        } else {
+                            @() | & $script:Export -Name "DUO" -NoResults
+                        }
+                        
+                        LogThis -m "Duo assessment completed" -lvl Done -show "`nCOMPLETED"
+                        
+                    } catch {
+                        LogThis -m "Error processing: $section" -lvl warn -ex $_
+                    }
+                } catch {
+                    LogThis -m "Duo assessment failed" -lvl Warn -ex $_
+                }
+            }
+        }
+        
+        $adSections = $Controls.Keys | Where-Object { $_ -notin @('DUO_PROXY', 'DUO') }
+        foreach ($section in $adSections) {
+            $script:SectionCounter++  # Counter increment
             LogThis -m "Processing: $section ($script:SectionCounter)" -show "$($section)"
             
             try {  # Nest each scriptblock in a try/catch
@@ -1676,7 +2990,34 @@ function Get-Controls {
             }
         }
 
-        LogThis -m "Controls successfully completed" -lvl Debug -show "COMPLETE"
+        LogThis -m "Controls successfully completed" -lvl Done -show "`nCOMPLETED"
+        
+        # Conditional sections     
+        if ($Proxy) {
+            LogThis -m "Processing Duo Proxy assessment" -lvl Header -show "DUO PROXY"
+            $script:SectionCounter++
+            try {
+                $scriptBlock = $Controls['DUO_PROXY']
+                & $scriptBlock
+                LogThis -m "Duo Proxy assessment completed" -lvl Done -show "`nCOMPLETED"
+            } catch {
+                LogThis -m "DUO_PROXY failed" -lvl Warn -ex $_
+                LogThis -m "Duo Proxy assessment completed" -lvl Done -show "`nCOMPLETED"
+            }
+        }
+        
+        if ($Duo) {
+            LogThis -m "Processing Duo Admin API assessment" -lvl Header -show "DUO ADMIN API"
+            $script:SectionCounter++
+            try {
+                $scriptBlock = $Controls['DUO']
+                & $scriptBlock
+                LogThis -m "Duo Admin API assessment completed" -lvl Done -show "`nCOMPLETED"
+            } catch {
+                LogThis -m "DUO failed" -lvl Warn -ex $_
+                LogThis -m "Duo Admin API assessment completed" -lvl Done -show "`nCOMPLETED"
+            }
+        }
 
     } catch {
         LogThis -m "Get-ActiveDirectory" -lvl Warn -ex $_ - show "Error gathering Active Directory details"
@@ -1697,17 +3038,18 @@ function Initialize{
     $script:CertModule = $CertModule   
     $script:Version = $Version
     $script:Directory = $Directory # from global script param
+    $script:ExportedFiles = @()
+    $script:SummarySections = @()
     try {
         $script:ADDomain = Get-ADDomain
-        $script:Filename = "$($script:ADDomain.DNSRoot)_$(& $script:Format (Get-Date) -Format File)" # Get-ADDomain succeeded
+        $script:Filename = "$($script:ADDomain.DNSRoot)" # Get-ADDomain succeeded
     } catch {
-        $script:Filename = "$($env:COMPUTERNAME)_$(& $script:Format (Get-Date) -Format File)"        # Get-ADDomain failed
+        $script:Filename = "$($env:COMPUTERNAME)"        # Get-ADDomain failed
     }
     $script:Log = Join-Path $script:Directory "$($script:Filename).log"
-    $script:Archive = Join-Path (Split-Path $script:Directory) "$($script:Filename).zip"
+    $script:Archive = Join-Path (Split-Path $script:Directory) "$($script:ADDomain.DNSRoot)_$(& $script:Format (Get-Date) -Format File).zip"
 
-    # 2. Initalize log file
-    try {
+    try { # Initalize log file
         if (-not (Test-Path $script:Directory)) {
             New-Item -Path $script:Directory -ItemType Directory -Force | Out-Null
             LogThis -m "Created: $($script:Directory)"
@@ -1734,12 +3076,12 @@ function Initialize{
     }
 
     
-    # 3. Inialize Active Directory
+    
     LogThis -m "Initializing AD varaibles"
     
     $script:LogonAge = 90 # Stale age thresholds
     $script:PasswordAge = 90 # Stale age thresholds
-    try {
+    try { # Inialize Active Directory
         try {
             $script:ADForest = Get-ADForest
             LogThis -m "Foret: $($script:ADForest)" -lvl Debug
@@ -1762,10 +3104,11 @@ function Initialize{
             "Enterprise Admins" = "$($script:ADDomain.DomainSID.Value)-519" # Universal
             "Domain Admins"     = "$($script:ADDomain.DomainSID.Value)-512" # Global
             "Protected Users"   = "$($script:ADDomain.DomainSID.Value)-525" # Global
-            "(Built-in) Administrators"    = "S-1-5-32-544"                 # Built-in
-            "(Built-in) Server Operators"   = "S-1-5-32-549"                # Built-in
-            "(Built-in) Hyper-V Administrators" = "S-1-5-32-578"            # Built-in
-            "(Built-in) Remote Desktop Users" = "S-1-5-32-555"              # Built-in alias
+            "Administrators"    = "S-1-5-32-544"                 # Built-in
+            "Server Operators"   = "S-1-5-32-549"                # Built-in
+            "Hyper-V Administrators" = "S-1-5-32-578"            # Built-in
+            "Remote Desktop Users" = "S-1-5-32-555"              # Built-in alias
+            # Code added below for special case handling  "Pre-Windows 2000 Compatible Access" = "S-1-5-32-554" # Built-in
             }
         } catch {
             LogThis -m "Privileged groups" -lvl Error -ex $_
@@ -1775,9 +3118,8 @@ function Initialize{
         return $false
     }
     
-    # 4. Initalize user & computer property lists
-    $script:UserProperties = @(
-        'SAMAccountname', 'Enabled', 'Name','DisplayName', 'LastLogonDate', 'Created',
+    $script:UserProperties = @( # Initalize user & computer property lists
+        'SAMAccountname', 'Enabled', 'Name','DisplayName', 'Description', 'LastLogonDate', 'Created',
         'Modified', 'AccountExpirationDate','PasswordLastSet', 'PasswordNeverExpires',
         'PasswordNotRequired', 'PasswordExpired','CannotChangePassword',
         'LastBadPasswordAttempt','badpwdcount', 'logonWorkStations',
@@ -1791,9 +3133,8 @@ function Initialize{
         'LastLogonDate', 'Enabled','TrustedForDelegation', 'whenCreated'
     )
 
-     # 5. Broadcast Status
-     $summary = @(
-        "SCRIPT: v$script:Version"
+     $summary = @(  # Broadcast Status
+        "`nSCRIPT: v$script:Version"
         "START:  $(& $script:Format $script:StartTime -Format Display)"
     ) -join "`n"
 
@@ -1815,12 +3156,10 @@ function Initialize{
 
     LogThis -m "$($details)" -lvl Status -show "$($summary)"
 
-    # 5. Prereqs
     LogThis -m "Checking prerequisites" -show "CHECKING PREREQUISITES" -lvl Header
     GetPrerequisites -Verify $script:RequiredModules
     
 }
-
 function BRAVE {
     [CmdletBinding()]
     param (
@@ -1830,11 +3169,11 @@ function BRAVE {
     LogThis -m "BRAVE running"
     
     try {
-        # 1. Discover functions to turn into scriptblocks
+        
         LogThis -m "Discovering Get-* functions"
         LogThis -m "Script Path: $($PSCommandPath)" -lvl Debug
 
-        $getFunctions = Get-Command -CommandType Function | 
+        $getFunctions = Get-Command -CommandType Function | # Discover functions to turn into scriptblocks
             Where-Object {
                 $_.ScriptBlock.File -eq $PSCommandPath -and 
                 $_.Name -like 'Get-*'
@@ -1844,23 +3183,11 @@ function BRAVE {
         $functionNames = $scriptblocks | ForEach-Object { $_.ToString() }
         LogThis -m "Executing: $($functionNames -join ', ')" -lvl Debug
 
-        # 2. Initialize progress bar
-        $progressParams = @{
-            Activity = "Executing BRAVE Assessment"
-            Status = "Starting..."
-            PercentComplete = 0
-        }
-        Write-Progress @progressParams
-
-        # 3. Execute scriptblocks
         $total = $scriptblocks.Count
-        foreach ($i in 0..($total-1)) {
+        
+        foreach ($i in 0..($total-1)) { 
             $command = $scriptblocks[$i]
-            $percentComplete = ($i / $total) * 100
-            
-            $progressParams.Status = "Running $($command.ToString())"
-            $progressParams.PercentComplete = $percentComplete
-            Write-Progress @progressParams
+
 
             LogThis -m "Running: $($command.ToString())" -lvl Debug
 
@@ -1872,7 +3199,6 @@ function BRAVE {
             }
         }
 
-        # 4. Create archive file
         LogThis -m "Creating archive file" -show "CREATING ARCHIVE FILE" -lvl Header
 
         try {
@@ -1926,11 +3252,15 @@ function BRAVE {
                 "STARTED:  $(& $script:Format $script:StartTime -Format Display)"
                 "FINISHED: $(& $script:Format (Get-Date) -Format Display)"
                 "DURATION: $durationFormatted"
-                "CREATED:  $script:Archive"
             ) -join "`n"
 
-            LogThis  -m "$summary" -lvl Info -show "$summary"
-            LogThis -m "=== BRAVE Assessment Complete ==="
+            LogThis -m "Creating archive file" -show "CREATED: $script:Archive" -lvl Info
+            
+            LogThis -m "Creating archive file" -show "`nCOMPLETED" -lvl Done
+            
+            LogThis -m "Summary" -show "SUMMARY" -lvl Header
+            LogThis -m "Summary details" -show $summary -lvl Info
+            LogThis -m "=== BRAVE Assessment Complete ===" -lvl Done -show "`nBRAVE SCRIPT COMPLETED"
             Start-Sleep -Milliseconds 500
 
             Compress-Archive -Path $script:Log -DestinationPath $script:Archive -Update
@@ -1959,9 +3289,6 @@ function BRAVE {
         }
     } catch {
         LogThis -m "BRAVE failed" -lvl Warn -ex $_ -show "BRAVE execution failed"
-    }
-    finally {
-        Write-Progress -Activity "Executing BRAVE Script" -Completed
     }
 }
 
